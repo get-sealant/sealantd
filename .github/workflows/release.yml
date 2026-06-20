@@ -14,7 +14,7 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # QEMU lets buildx build the arm64 image on an amd64 runner (emulated). For faster releases,
       # swap this single job for a per-arch matrix on native runners + a manifest merge.
@@ -56,11 +56,11 @@ jobs:
       contents: read
       id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
       # --ignore-scripts: never run dependency lifecycle scripts in the publish job. The build below
       # needs none (codegen is committed; build is just tsc).
