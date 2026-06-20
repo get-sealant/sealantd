@@ -1,0 +1,451 @@
+// sealantd control protocol — the cross-language wire contract (ADR-0012).
+//
+// Field names are snake_case (codegen idiomatizes per language). The Rust daemon keeps rich domain
+// types + serde for a debug-JSON view and converts to/from these messages at the wire boundary.
+syntax = "proto3";
+
+package sealant.v1;
+
+// ===================== enums =====================
+
+enum RuntimeState {
+  RUNTIME_STATE_UNSPECIFIED = 0;
+  RUNTIME_STATE_STARTING = 1;
+  RUNTIME_STATE_HEALTHY = 2;
+  RUNTIME_STATE_DEGRADED = 3;
+  RUNTIME_STATE_UNHEALTHY = 4;
+  RUNTIME_STATE_SHUTTING_DOWN = 5;
+  RUNTIME_STATE_STOPPED = 6;
+}
+
+enum ProcessState {
+  PROCESS_STATE_UNSPECIFIED = 0;
+  PROCESS_STATE_CREATED = 1;
+  PROCESS_STATE_STARTING = 2;
+  PROCESS_STATE_RUNNING = 3;
+  PROCESS_STATE_TERMINATING = 4;
+  PROCESS_STATE_EXITED = 5;
+  PROCESS_STATE_SIGNALED = 6;
+  PROCESS_STATE_FAILED = 7;
+}
+
+enum ExitReason {
+  EXIT_REASON_UNSPECIFIED = 0;
+  EXIT_REASON_EXITED = 1;
+  EXIT_REASON_SIGNALED = 2;
+  EXIT_REASON_TIMEOUT = 3;
+  EXIT_REASON_CANCELLED = 4;
+  EXIT_REASON_START_FAILED = 5;
+  EXIT_REASON_LOST = 6;
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  STREAM_KIND_STDIN = 1;
+  STREAM_KIND_STDOUT = 2;
+  STREAM_KIND_STDERR = 3;
+  STREAM_KIND_PTY_INPUT = 4;
+  STREAM_KIND_PTY_OUTPUT = 5;
+}
+
+enum CaptureMethod {
+  CAPTURE_METHOD_UNSPECIFIED = 0;
+  CAPTURE_METHOD_PIPE = 1;
+  CAPTURE_METHOD_PTY = 2;
+  CAPTURE_METHOD_PROXY = 3;
+  CAPTURE_METHOD_INOTIFY = 4;
+  CAPTURE_METHOD_SNAPSHOT = 5;
+  CAPTURE_METHOD_EBPF = 6;
+  CAPTURE_METHOD_NETLINK = 7;
+  CAPTURE_METHOD_INTERNAL = 8;
+}
+
+enum Confidence {
+  CONFIDENCE_UNSPECIFIED = 0;
+  CONFIDENCE_OBSERVED = 1;
+  CONFIDENCE_INFERRED = 2;
+  CONFIDENCE_UNKNOWN = 3;
+}
+
+enum EventPriority {
+  EVENT_PRIORITY_UNSPECIFIED = 0;
+  EVENT_PRIORITY_CRITICAL = 1;
+  EVENT_PRIORITY_NORMAL = 2;
+  EVENT_PRIORITY_LOW = 3;
+}
+
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  FEATURE_FILESYSTEM_DIFFING = 1;
+  FEATURE_LIVE_FILESYSTEM_WATCHING = 2;
+  FEATURE_NETWORK_COLLECTION = 3;
+  FEATURE_PAYLOAD_CAPTURE = 4;
+  FEATURE_VERBOSE_IO_CAPTURE = 5;
+  FEATURE_RESOURCE_SAMPLING = 6;
+}
+
+enum Signal {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_HUP = 1;
+  SIGNAL_INT = 2;
+  SIGNAL_QUIT = 3;
+  SIGNAL_TERM = 4;
+  SIGNAL_KILL = 5;
+  SIGNAL_USR1 = 6;
+  SIGNAL_USR2 = 7;
+  SIGNAL_STOP = 8;
+  SIGNAL_CONT = 9;
+}
+
+enum CaptureMode {
+  CAPTURE_MODE_UNSPECIFIED = 0;
+  CAPTURE_MODE_FULL = 1;
+  CAPTURE_MODE_METADATA_ONLY = 2;
+  CAPTURE_MODE_DISABLED = 3;
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_OFF = 1;
+  NETWORK_MODE_METADATA = 2;
+  NETWORK_MODE_PROXY = 3;
+  NETWORK_MODE_PRIVILEGED = 4;
+  NETWORK_MODE_PAYLOAD = 5;
+}
+
+enum ControlErrorCode {
+  CONTROL_ERROR_CODE_UNSPECIFIED = 0;
+  CONTROL_ERROR_CODE_INVALID_JSON = 1;
+  CONTROL_ERROR_CODE_UNSUPPORTED_VERSION = 2;
+  CONTROL_ERROR_CODE_FRAME_TOO_LARGE = 3;
+  CONTROL_ERROR_CODE_UNKNOWN_COMMAND = 4;
+  CONTROL_ERROR_CODE_INVALID_ARGUMENT = 5;
+  CONTROL_ERROR_CODE_MISSING_COMMAND = 6;
+  CONTROL_ERROR_CODE_EXECUTION_NOT_FOUND = 7;
+  CONTROL_ERROR_CODE_SESSION_NOT_FOUND = 8;
+  CONTROL_ERROR_CODE_PROCESS_NOT_FOUND = 9;
+  CONTROL_ERROR_CODE_PROCESS_START_FAILED = 10;
+  CONTROL_ERROR_CODE_PTY_ALLOCATION_FAILED = 11;
+  CONTROL_ERROR_CODE_PERMISSION_DENIED = 12;
+  CONTROL_ERROR_CODE_POLICY_DENIED = 13;
+  CONTROL_ERROR_CODE_FEATURE_UNAVAILABLE = 14;
+  CONTROL_ERROR_CODE_CAPABILITY_UNAVAILABLE = 15;
+  CONTROL_ERROR_CODE_QUEUE_FULL = 16;
+  CONTROL_ERROR_CODE_RUNTIME_SHUTTING_DOWN = 17;
+  CONTROL_ERROR_CODE_INTERNAL_ERROR = 18;
+}
+
+// ===================== value messages =====================
+
+message EnvVar {
+  string key = 1;
+  string value = 2;
+}
+
+message CapturePolicy {
+  CaptureMode stdout = 1;
+  CaptureMode stderr = 2;
+  CaptureMode stdin = 3;
+}
+
+message ArtifactRef {
+  string algo = 1;
+  string hash = 2;
+  uint64 bytes = 3;
+}
+
+message TransformMeta {
+  bool redacted = 1;
+  bool truncated = 2;
+  bool coalesced = 3;
+  optional uint64 original_byte_count = 4;
+}
+
+message Limits {
+  uint32 max_frame_bytes = 1;
+  uint32 max_processes = 2;
+  uint32 max_sessions = 3;
+  uint64 event_queue_capacity = 4;
+  uint64 spool_limit_bytes = 5;
+  uint64 max_inline_payload_bytes = 6;
+  uint32 io_chunk_bytes = 7;
+}
+
+message FeatureMatrix {
+  bool io_capture = 1;
+  bool pty = 2;
+  bool filesystem = 3;
+  NetworkMode network = 4;
+  bool privileged = 5;
+  bool pidfd = 6;
+  bool subreaper = 7;
+}
+
+message FeatureState {
+  Feature feature = 1;
+  bool enabled = 2;
+}
+
+// ===================== event payloads =====================
+
+message ProcessStarted {
+  int32 pid = 1;
+  int32 pgid = 2;
+  bool pidfd = 3;
+  string executable = 4;
+  repeated string args = 5;
+  string cwd = 6;
+  int64 started_at = 7;
+}
+
+message ProcessExited {
+  optional int32 exit_code = 1;
+  optional int32 signal = 2;
+  ExitReason reason = 3;
+  uint64 duration_micros = 4;
+}
+
+message IoChunk {
+  StreamKind stream = 1;
+  uint64 byte_count = 2;
+  uint64 stream_offset = 3;
+  optional bytes content = 4;
+  optional ArtifactRef artifact = 5;
+  optional TransformMeta transform = 6;
+}
+
+message RuntimeStateChanged {
+  RuntimeState state = 1;
+  optional string reason = 2;
+}
+
+message RuntimeHeartbeat {
+  RuntimeState state = 1;
+}
+
+message TelemetryDropped {
+  string reason = 1;
+  uint64 count = 2;
+  EventPriority priority = 3;
+}
+
+message EventEnvelope {
+  uint32 schema_version = 1;
+  string event_id = 2;
+  string runtime_id = 3;
+  optional string execution_id = 4;
+  optional string session_id = 5;
+  optional string process_id = 6;
+  optional string request_id = 7;
+  uint64 sequence = 8;
+  int64 observed_at = 9;
+  uint64 monotonic_timestamp = 10;
+  CaptureMethod capture_method = 11;
+  Confidence confidence = 12;
+  oneof payload {
+    RuntimeStateChanged runtime_state_changed = 20;
+    RuntimeHeartbeat runtime_heartbeat = 21;
+    ProcessStarted process_started = 22;
+    ProcessExited process_exited = 23;
+    IoChunk io_chunk = 24;
+    TelemetryDropped telemetry_dropped = 25;
+  }
+}
+
+// ===================== commands =====================
+
+message ExecArgs {
+  optional string execution_id = 1;
+  optional string session_id = 2;
+  string executable = 3;
+  repeated string args = 4;
+  optional string cwd = 5;
+  repeated EnvVar env = 6;
+  bool stdin = 7;
+  optional uint64 timeout_millis = 8;
+  bool background = 9;
+  optional CapturePolicy capture = 10;
+  optional Signal graceful_signal = 11;
+}
+
+message ExecutionStartArgs {
+  optional string execution_id = 1;
+  optional string labels_json = 2;
+}
+
+message WriteStdinArgs {
+  optional string process_id = 1;
+  optional string session_id = 2;
+  bytes data = 3;
+}
+
+message OpenSessionArgs {
+  optional string execution_id = 1;
+  optional string shell = 2;
+  repeated string args = 3;
+  optional string cwd = 4;
+  repeated EnvVar env = 5;
+  uint32 cols = 6;
+  uint32 rows = 7;
+  optional string term = 8;
+}
+
+message RuntimeGracefulShutdownArgs { optional uint64 grace_millis = 1; }
+message ExecutionStopArgs { string execution_id = 1; }
+message SignalProcessArgs { string process_id = 1; Signal signal = 2; }
+message KillProcessArgs { string process_id = 1; }
+message ListProcessesArgs { optional string execution_id = 1; }
+message CloseStdinArgs { string process_id = 1; }
+message CloseSessionArgs { string session_id = 1; }
+message ResizePtyArgs { string session_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message SetFeatureStateArgs { Feature feature = 1; bool enabled = 2; }
+message Empty {}
+
+message Command {
+  oneof command {
+    Empty runtime_health = 1;
+    Empty runtime_get_capabilities = 2;
+    RuntimeGracefulShutdownArgs runtime_graceful_shutdown = 3;
+    Empty runtime_kill = 4;
+    ExecutionStartArgs execution_start = 5;
+    ExecutionStopArgs execution_stop = 6;
+    ExecArgs exec = 7;
+    SignalProcessArgs signal_process = 8;
+    KillProcessArgs kill_process = 9;
+    ListProcessesArgs list_processes = 10;
+    WriteStdinArgs write_stdin = 11;
+    CloseStdinArgs close_stdin = 12;
+    OpenSessionArgs open_session = 13;
+    CloseSessionArgs close_session = 14;
+    ResizePtyArgs resize_pty = 15;
+    Empty list_sessions = 16;
+    SetFeatureStateArgs set_feature_state = 17;
+    Empty get_runtime_metrics = 18;
+  }
+}
+
+// ===================== results =====================
+
+message Capabilities {
+  uint32 schema_version = 1;
+  string runtime_id = 2;
+  optional string sandbox_id = 3;
+  string os = 4;
+  string arch = 5;
+  string daemon_version = 6;
+  FeatureMatrix features = 7;
+  Limits limits = 8;
+}
+
+message HealthReport {
+  RuntimeState state = 1;
+  string runtime_id = 2;
+  uint64 uptime_millis = 3;
+  uint32 active_executions = 4;
+  uint32 active_sessions = 5;
+  uint32 active_processes = 6;
+  uint64 queue_depth = 7;
+  uint64 queue_capacity = 8;
+  uint64 spool_bytes = 9;
+  uint64 spool_limit_bytes = 10;
+  uint64 retry_count = 11;
+  optional int64 last_delivery_at = 12;
+  uint64 dropped_events = 13;
+  uint64 redacted_events = 14;
+  uint64 coalesced_events = 15;
+  uint64 truncated_events = 16;
+  bool sink_connected = 17;
+  repeated FeatureState feature_states = 18;
+  repeated string degradation_reasons = 19;
+}
+
+message ExecAccepted { string process_id = 1; int32 pid = 2; int32 pgid = 3; bool pidfd = 4; }
+message SessionOpened { string session_id = 1; string process_id = 2; int32 pid = 3; }
+
+message ProcessSummary {
+  string process_id = 1;
+  int32 pid = 2;
+  int32 pgid = 3;
+  ProcessState state = 4;
+  string executable = 5;
+  optional string execution_id = 6;
+  optional string session_id = 7;
+}
+message ProcessList { repeated ProcessSummary processes = 1; }
+
+message SessionSummary {
+  string session_id = 1;
+  string process_id = 2;
+  int32 pid = 3;
+  uint32 cols = 4;
+  uint32 rows = 5;
+  optional string execution_id = 6;
+}
+message SessionList { repeated SessionSummary sessions = 1; }
+
+message RuntimeMetrics {
+  uint64 uptime_millis = 1;
+  uint64 events_emitted = 2;
+  uint64 events_delivered = 3;
+  uint64 dropped_events = 4;
+  uint64 queue_depth = 5;
+  uint64 spool_bytes = 6;
+  uint32 active_processes = 7;
+  uint32 active_sessions = 8;
+}
+
+message ShutdownAccepted { uint64 grace_millis = 1; }
+
+message CommandResult {
+  oneof result {
+    HealthReport health = 1;
+    Capabilities capabilities = 2;
+    ExecAccepted exec_accepted = 3;
+    SessionOpened session_opened = 4;
+    ProcessList process_list = 5;
+    SessionList session_list = 6;
+    RuntimeMetrics metrics = 7;
+    ShutdownAccepted shutdown_accepted = 8;
+    Empty accepted = 9;
+  }
+}
+
+message ControlError {
+  ControlErrorCode code = 1;
+  string message = 2;
+  optional string detail_json = 3;
+}
+
+// ===================== top-level messages =====================
+
+message ControlRequest {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  Command command = 3;
+}
+
+message ResponseOutcome {
+  oneof outcome {
+    CommandResult ok = 1;     // present on success (may itself carry no data via Empty "accepted")
+    ControlError error = 2;
+  }
+}
+
+message ControlResponse {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  ResponseOutcome outcome = 3;
+}
+
+message ClientMessage {
+  oneof message {
+    ControlRequest request = 1;
+  }
+}
+
+message ServerMessage {
+  oneof message {
+    ControlResponse response = 1;
+    EventEnvelope event = 2;
+  }
+}

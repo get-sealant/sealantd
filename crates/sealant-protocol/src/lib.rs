@@ -14,14 +14,23 @@
 
 pub mod bytes;
 pub mod command;
+pub mod convert;
 pub mod error;
 pub mod event;
 pub mod frame;
 pub mod ids;
 pub mod message;
 
+/// Generated Protobuf wire types (ADR-0012). The hand-written domain types above convert to/from
+/// these at the wire boundary; serde on the domain types remains the debug-JSON view.
+#[allow(missing_docs, clippy::doc_markdown, unreachable_pub)]
+pub mod wire {
+    include!(concat!(env!("OUT_DIR"), "/sealant.v1.rs"));
+}
+
 pub use bytes::Base64Bytes;
 pub use command::*;
+pub use convert::{WireError, decode_client, decode_server, encode_client, encode_server};
 pub use error::{ControlError, ControlErrorCode};
 pub use event::*;
 pub use frame::{DEFAULT_MAX_FRAME_BYTES, LENGTH_PREFIX_BYTES, MIN_MAX_FRAME_BYTES};
