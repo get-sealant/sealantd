@@ -12,14 +12,17 @@ permissions:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    # Blacksmith runner: faster builds + Docker layer caching for the heavy multi-arch image build.
+    # (The npm job stays on ubuntu-latest — github-hosted — to keep OIDC trusted publishing safe.)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
 
-      # QEMU lets buildx build the arm64 image on an amd64 runner (emulated). For faster releases,
-      # swap this single job for a per-arch matrix on native runners + a manifest merge.
+      # QEMU emulates arm64 on this amd64 runner; useblacksmith/setup-docker-builder adds sticky-disk
+      # layer caching. Real arm64 speedup later = native arm64 Blacksmith runners + a per-arch matrix
+      # (drops QEMU).
       - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: useblacksmith/setup-docker-builder@v1
 
       - uses: docker/login-action@v3
         with:
@@ -36,7 +39,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
-      - uses: docker/build-push-action@v6
+      - uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile
