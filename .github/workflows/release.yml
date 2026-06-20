@@ -71,11 +71,8 @@ jobs:
           pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" \
             exec npm version "$VERSION" --no-git-tag-version --allow-same-version
       - run: pnpm -r build
-      # Token-based publish (interim). Once Trusted Publishing is configured on npmjs.com for BOTH
-      # packages, delete `env: NODE_AUTH_TOKEN` below and the NPM_TOKEN secret — the OIDC id-token
-      # above authenticates the publish with no stored credential.
-      # `--provenance` is intentionally omitted: npm provenance requires a PUBLIC source repo, so add
-      # it back only once these repos are public.
-      - run: pnpm -r publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Tokenless publish via npm Trusted Publishing: the OIDC id-token (permissions above)
+      # authenticates the publish — no stored credential. --provenance attaches a public build
+      # attestation (the source repo is public). Configure the matching trusted publisher on
+      # npmjs.com for BOTH packages: repo get-sealant/sealantd, workflow release.yml, env npm-publish.
+      - run: pnpm -r publish --access public --no-git-checks --provenance
