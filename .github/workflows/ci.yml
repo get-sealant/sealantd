@@ -1,0 +1,51 @@
+# Tests on every PR and on pushes to main.
+#
+# SECURITY: this uses `pull_request` (NOT `pull_request_target`). That means PRs — including from
+# forks — run in the PR's own context with a read-only GITHUB_TOKEN and NO access to repo secrets.
+# A malicious PR can run code in the ephemeral runner but cannot read secrets, push, or publish.
+# Nothing here references a secret, by design.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: read-only, no write, no id-token.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false # don't leave the git token in .git for later steps
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # ubuntu-latest is Linux, so this also runs the Linux-only tests (inotify, peer-cred, reaper).
+      - run: cargo test --workspace
+
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: corepack enable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # --ignore-scripts: never run dependency lifecycle scripts (untrusted on fork PRs).
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm -r build
+      - run: cargo build -p sealantd # the TypeScript e2e spawns the daemon binary
+      - run: pnpm -r test

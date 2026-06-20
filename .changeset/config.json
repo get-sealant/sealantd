@@ -1,0 +1,10 @@
+{
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "fixed": [["@sealant/runtime-protocol", "@sealant/runtime-client"]],
+  "linked": [],
+  "ignore": []
+}

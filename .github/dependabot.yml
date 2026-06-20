@@ -1,0 +1,22 @@
+# Keep GitHub Actions, npm, and Cargo dependencies patched. Recommended next step for "very safe":
+# pin actions to full commit SHAs (Dependabot then bumps the SHA + leaves the version in a comment),
+# which removes the action-tag-hijack supply-chain risk.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
