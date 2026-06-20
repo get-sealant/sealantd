@@ -586,4 +586,164 @@ mod tests {
             sealant_protocol::ControlErrorCode::ProcessStartFailed
         );
     }
+
+    fn stream_bytes(payloads: &[EventPayload], kind: StreamKind) -> Vec<u8> {
+        payloads
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == kind => {
+                    c.content.as_ref().map(|b| b.as_slice().to_vec())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stdin_streaming_echoes_through_cat() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        let mut args = exec_args("/bin/cat", &[]);
+        args.stdin = true;
+        let accepted = rt.exec(args, None).expect("spawn");
+        rt.write_stdin(&accepted.process_id, b"hello stdin\n")
+            .await
+            .expect("write");
+        rt.close_stdin(&accepted.process_id).await.expect("close");
+        let payloads = collect_until_exit(&mut rx).await;
+        assert_eq!(
+            stream_bytes(&payloads, StreamKind::Stdout),
+            b"hello stdin\n"
+        );
+        match payloads.last() {
+            Some(EventPayload::ProcessExited(e)) => assert_eq!(e.exit_code, Some(0)),
+            other => panic!("expected exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn killing_process_group_reaps_grandchild() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        // sh backgrounds a sleep (same process group, no job control) and blocks on wait.
+        let accepted = rt
+            .exec(
+                exec_args("/bin/sh", &["-c", "sleep 30 & echo $!; wait"]),
+                None,
+            )
+            .expect("spawn");
+
+        // Capture the grandchild pid printed to stdout.
+        let grandchild = loop {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            if let EventPayload::IoChunk(c) = &env.payload
+                && c.stream == StreamKind::Stdout
+                && let Some(content) = &c.content
+                && let Ok(pid) = String::from_utf8_lossy(content.as_slice())
+                    .trim()
+                    .parse::<i32>()
+            {
+                break pid;
+            }
+        };
+        assert!(
+            kill(Pid::from_raw(grandchild), None).is_ok(),
+            "grandchild should be alive before kill"
+        );
+
+        rt.kill(&accepted.process_id).expect("kill");
+
+        // Drain to the managed process exit.
+        loop {
+            let env = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no timeout")
+                .expect("event");
+            if matches!(env.payload, EventPayload::ProcessExited(_)) {
+                break;
+            }
+        }
+
+        // The grandchild must be reaped by the process-group kill: no orphan.
+        let mut reaped = false;
+        for _ in 0..100 {
+            if kill(Pid::from_raw(grandchild), None).is_err() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reaped, "grandchild {grandchild} should be reaped");
+        assert_eq!(rt.registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ignored_sigterm_escalates_to_sigkill() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        // Ignore SIGTERM and spin; the timeout path must escalate to an untrappable SIGKILL.
+        let mut args = exec_args("/bin/sh", &["-c", "trap '' TERM; while true; do :; done"]);
+        args.timeout_millis = Some(150);
+        rt.exec(args, None).expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        match payloads.last() {
+            Some(EventPayload::ProcessExited(e)) => {
+                assert_eq!(e.reason, ExitReason::Timeout);
+                assert_eq!(e.signal, Some(nix::sys::signal::Signal::SIGKILL as i32));
+            }
+            other => panic!("expected sigkill timeout exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_stdout_and_stderr_are_captured() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.exec(
+            exec_args("/bin/sh", &["-c", "printf out >&1; printf err >&2"]),
+            None,
+        )
+        .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        assert_eq!(stream_bytes(&payloads, StreamKind::Stdout), b"out");
+        assert_eq!(stream_bytes(&payloads, StreamKind::Stderr), b"err");
+    }
+
+    #[tokio::test]
+    async fn large_stdout_is_chunked_with_monotonic_offsets() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.exec(
+            exec_args(
+                "/bin/sh",
+                &["-c", "head -c 1000000 /dev/zero | tr '\\0' 'A'"],
+            ),
+            None,
+        )
+        .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+
+        let out = stream_bytes(&payloads, StreamKind::Stdout);
+        assert_eq!(out.len(), 1_000_000);
+        assert!(out.iter().all(|&b| b == b'A'));
+
+        // Offsets must be contiguous and cover the whole stream.
+        let mut expected = 0u64;
+        for payload in &payloads {
+            if let EventPayload::IoChunk(c) = payload
+                && c.stream == StreamKind::Stdout
+            {
+                assert_eq!(c.stream_offset.get(), expected);
+                expected += c.byte_count;
+            }
+        }
+        assert_eq!(expected, 1_000_000);
+    }
 }

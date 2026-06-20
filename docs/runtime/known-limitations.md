@@ -155,3 +155,28 @@ event. The default unprivileged target is `metadata` + explicit `proxy`; the
   proxy / TLS-termination backend is an opt-in feature gated behind a separate
   privacy review and the capability requirements above — not part of the default
   honest-observability posture. (REQ-SEC / REQ-NET.)
+
+### PID-reuse signalling uses a documented fallback, not pidfd (yet)
+- **Limitation.** Process signalling targets the OS process group via `killpg`
+  rather than a `pidfd`, so there is a theoretical PID/PGID-reuse race.
+- **Why.** pidfd is Linux-only and the dev host is macOS; the cross-platform path
+  must work everywhere. Plan §10.4 explicitly permits "a documented safe fallback".
+- **What we do instead.** We only signal while the managed process is in a *live*
+  state, and the owning Tokio task holds the `Child` (and therefore the unreaped
+  pid) until it publishes `process.exited` — so the pid is not reaped, and thus not
+  reusable, underneath a signal. The window between kernel exit and Tokio's reap is
+  sub-millisecond and a group-leader pgid reuse within it is vanishingly unlikely.
+  `process.started.pidfd` and `capabilities.features.pidfd` report `false` until a
+  Linux pidfd path lands (ADR-0006). (REQ-PROC, Phase 2.)
+
+### Adopted-orphan reaping (subreaper / PID 1) is deferred
+- **Limitation.** A managed process that double-forks an orphan that then exits can
+  leave a zombie unless something reaps it. We do not yet install
+  `PR_SET_CHILD_SUBREAPER` + a reaper, nor a PID-1 init.
+- **Why.** A global `waitpid(-1)` reaper conflicts with Tokio's own child reaping
+  (it would steal Tokio's children); doing this correctly needs a registry-guarded
+  reaper or a non-Tokio managed-child model, and must be validated on Linux/PID 1.
+- **What we do instead.** On terminate/timeout/shutdown we `SIGKILL` the whole
+  *process group*, so orphans are *killed* (not left running) even when their
+  zombie reaping depends on the environment's init. Full subreaper + PID-1 reaping
+  is the next dedicated Phase 2 increment (ADR-0006), validated via docker. (REQ-PROC.)

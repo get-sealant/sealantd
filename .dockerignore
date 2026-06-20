@@ -1,0 +1,7 @@
+/target
+target
+**/target
+node_modules
+.git
+*.sock
+*.log

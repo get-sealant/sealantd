@@ -1,0 +1,6 @@
+# Validate the workspace on real Linux (pidfd/process-group/inotify/PTY ctty targets).
+# Usage: docker build -f docker/Dockerfile.test -t sealantd-linux-test .
+FROM rust:slim
+WORKDIR /src
+COPY . .
+RUN cargo test --workspace --no-fail-fast
