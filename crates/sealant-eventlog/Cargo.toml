@@ -4,6 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Append-only durable spool with checksums, recovery, and rotation."
 
 [lints]
 workspace = true
+
+[dependencies]
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
