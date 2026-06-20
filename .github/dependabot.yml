@@ -1,6 +1,6 @@
-# Keep GitHub Actions, npm, and Cargo dependencies patched. Recommended next step for "very safe":
-# pin actions to full commit SHAs (Dependabot then bumps the SHA + leaves the version in a comment),
-# which removes the action-tag-hijack supply-chain risk.
+# Keep GitHub Actions, npm, and Cargo dependencies patched. Updates are grouped per ecosystem so a
+# run is 1-3 PRs, not a flood. For "very safe": pin actions to full commit SHAs and Dependabot will
+# bump the SHA + keep the version in a comment.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -15,8 +15,21 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
 
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # Breaking majors that require code changes — adopt deliberately, not via auto-PR:
+      #   getrandom 0.4 renames getrandom() -> fill(); sha2 0.11 moves to digest 0.11.
+      - dependency-name: "getrandom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
