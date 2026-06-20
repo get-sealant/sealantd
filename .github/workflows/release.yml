@@ -52,9 +52,9 @@ jobs:
   npm:
     runs-on: ubuntu-latest
     # Gate every publish behind a protected environment: add required reviewers + restrict deployment
-    # to protected tags in repo Settings -> Environments -> npm-publish. This means a compromised PR,
+    # to protected tags in repo Settings -> Environments -> release. This means a compromised PR,
     # dependency, or fork cannot trigger a publish without human approval.
-    environment: npm-publish
+    environment: release
     permissions:
       contents: read
       id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
@@ -80,5 +80,5 @@ jobs:
       # Tokenless publish via npm Trusted Publishing: the OIDC id-token (permissions above)
       # authenticates the publish — no stored credential. --provenance attaches a public build
       # attestation (the source repo is public). Configure the matching trusted publisher on
-      # npmjs.com for BOTH packages: repo get-sealant/sealantd, workflow release.yml, env npm-publish.
+      # npmjs.com for BOTH packages: repo get-sealant/sealantd, workflow release.yml, env release.
       - run: pnpm -r publish --access public --no-git-checks --provenance
