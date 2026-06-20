@@ -65,6 +65,10 @@ pub struct RuntimeConfig {
     /// Requested network observation mode (may be degraded by capability detection).
     #[serde(default)]
     pub network_mode: NetworkMode,
+    /// Additional uids permitted to connect to the control socket (beyond the daemon's own uid and
+    /// root). Empty by default.
+    #[serde(default)]
+    pub allowed_peer_uids: Vec<u32>,
 }
 
 /// Default bounded limits for the smallest sandbox.
@@ -104,6 +108,7 @@ impl RuntimeConfig {
             log_level: "info".to_owned(),
             watch_filesystem: false,
             network_mode: NetworkMode::Off,
+            allowed_peer_uids: Vec::new(),
         }
     }
 

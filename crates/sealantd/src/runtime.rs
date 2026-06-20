@@ -18,7 +18,7 @@ use sealant_protocol::{
     RuntimeMetrics, RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, ShutdownAccepted, Signal,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
-use sealant_runtime_core::{Clock, IdGenerator, RuntimeConfig, RuntimeStatus};
+use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use tokio::sync::broadcast;
 
@@ -26,6 +26,27 @@ use crate::shutdown::ShutdownSignal;
 
 /// Daemon build version.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Collect the values of secret-looking env vars so captured I/O can redact them (plan §18).
+fn secret_env_values(config: &RuntimeConfig) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "APIKEY",
+        "CREDENTIAL",
+    ];
+    config
+        .child_env
+        .iter()
+        .filter(|var| {
+            let key = var.key.to_ascii_uppercase();
+            MARKERS.iter().any(|m| key.contains(m)) || key.ends_with("_KEY") || key == "KEY"
+        })
+        .map(|var| var.value.clone())
+        .collect()
+}
 
 fn default_feature_states() -> HashMap<Feature, bool> {
     HashMap::from([
@@ -110,6 +131,8 @@ impl Runtime {
         let status = Arc::new(RuntimeStatus::new());
         let bus = build_bus(&config, &clock, &idgen);
         let extra_env = Arc::new(Mutex::new(Vec::new()));
+        // Redact the values of secret-looking env vars from captured I/O (plan §18).
+        let redactor = Arc::new(Redactor::new(secret_env_values(&config)));
         let processes = ProcessRuntime {
             registry: Arc::new(ProcessRegistry::new()),
             bus: bus.clone(),
@@ -118,6 +141,7 @@ impl Runtime {
             clock: clock.clone(),
             config: config.clone(),
             extra_env: extra_env.clone(),
+            redactor,
         };
         let sessions = SessionRuntime {
             registry: Arc::new(SessionRegistry::new()),
@@ -146,6 +170,10 @@ impl Runtime {
         // Become a child subreaper so double-forked orphans reparent here (and the reaper can
         // collect them). Harmless and idempotent; a no-op off Linux.
         let subreaper = sealant_process::platform::set_child_subreaper();
+        // Defense in depth: children can never escalate via setuid binaries (plan §18).
+        if sealant_process::platform::set_no_new_privs() {
+            tracing::debug!("PR_SET_NO_NEW_PRIVS engaged");
+        }
         let pidfd_supported = sealant_process::platform::pidfd_supported();
         Arc::new(Self {
             config,
@@ -175,6 +203,12 @@ impl Runtime {
     #[must_use]
     pub fn socket_path(&self) -> std::path::PathBuf {
         self.config.socket_path.clone()
+    }
+
+    /// Uids permitted to connect to the control socket (beyond the daemon's own uid and root).
+    #[must_use]
+    pub fn allowed_peer_uids(&self) -> Vec<u32> {
+        self.config.allowed_peer_uids.clone()
     }
 
     /// The shared shutdown signal.
@@ -327,7 +361,7 @@ impl Runtime {
             retry_count: 0,
             last_delivery_at: None,
             dropped_events: self.bus.dropped(),
-            redacted_events: 0,
+            redacted_events: u64::from(self.status.redacted()),
             coalesced_events: 0,
             truncated_events: 0,
             sink_connected: self.bus.subscriber_count() > 0,

@@ -1,0 +1,36 @@
+[package]
+name = "sealantd-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sealant-protocol = { path = "../crates/sealant-protocol" }
+
+[[bin]]
+name = "decode_client"
+path = "fuzz_targets/decode_client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_server"
+path = "fuzz_targets/decode_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_event"
+path = "fuzz_targets/decode_event.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace (cargo-fuzz crates build under nightly only).
+[workspace]

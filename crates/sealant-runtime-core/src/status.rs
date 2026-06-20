@@ -34,6 +34,7 @@ pub struct RuntimeStatus {
     active_processes: AtomicU32,
     active_sessions: AtomicU32,
     active_executions: AtomicU32,
+    redacted_events: AtomicU32,
     degradation: Mutex<Vec<String>>,
 }
 
@@ -46,8 +47,22 @@ impl RuntimeStatus {
             active_processes: AtomicU32::new(0),
             active_sessions: AtomicU32::new(0),
             active_executions: AtomicU32::new(0),
+            redacted_events: AtomicU32::new(0),
             degradation: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Add to the count of telemetry events that had secrets redacted.
+    pub fn add_redacted(&self, n: u32) {
+        if n > 0 {
+            self.redacted_events.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Total telemetry events that had secrets redacted.
+    #[must_use]
+    pub fn redacted(&self) -> u32 {
+        self.redacted_events.load(Ordering::Relaxed)
     }
 
     /// The current lifecycle state.

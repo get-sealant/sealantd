@@ -24,6 +24,22 @@ pub fn set_child_subreaper() -> bool {
     false
 }
 
+/// Best-effort `PR_SET_NO_NEW_PRIVS` (plan §18): after this, no child can gain privileges via a
+/// setuid/setgid binary or file capabilities. Irreversible and inherited; safe for a sandbox that
+/// never relies on privilege escalation. Returns whether it took effect (Linux only).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn set_no_new_privs() -> bool {
+    nix::sys::prctl::set_no_new_privs().is_ok()
+}
+
+/// Off Linux there is no `no_new_privs`.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn set_no_new_privs() -> bool {
+    false
+}
+
 /// Whether the kernel supports `pidfd_open(2)` (Linux >= 5.3).
 #[cfg(target_os = "linux")]
 #[must_use]

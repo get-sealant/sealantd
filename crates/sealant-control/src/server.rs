@@ -199,11 +199,13 @@ fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
 pub async fn serve_unix<S: ControlService>(
     service: Arc<S>,
     path: &Path,
+    allowed_peer_uids: Vec<u32>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     prepare_socket_path(path)?;
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let self_uid = crate::peer::self_uid();
     tracing::info!(socket = %path.display(), "control socket listening");
 
     loop {
@@ -216,6 +218,13 @@ pub async fn serve_unix<S: ControlService>(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        // Reject unauthorized peers (plan §18). The socket is already 0600; this
+                        // adds an SO_PEERCRED uid check (Linux) and fails closed if unknown.
+                        if !crate::peer::validate_peer(&stream, self_uid, &allowed_peer_uids) {
+                            tracing::warn!("rejected control connection from unauthorized peer");
+                            drop(stream);
+                            continue;
+                        }
                         let service = service.clone();
                         let shutdown = shutdown.clone();
                         let (read_half, write_half) = stream.into_split();

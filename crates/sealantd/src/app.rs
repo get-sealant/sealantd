@@ -206,7 +206,8 @@ async fn serve(cli: Cli, runtime: Arc<Runtime>) -> ExitCode {
         })
     } else {
         let path = serve_runtime.socket_path();
-        tokio::spawn(async move { serve_unix(serve_runtime, &path, serve_rx).await })
+        let allowed = serve_runtime.allowed_peer_uids();
+        tokio::spawn(async move { serve_unix(serve_runtime, &path, allowed, serve_rx).await })
     };
 
     let serve_finished = tokio::select! {

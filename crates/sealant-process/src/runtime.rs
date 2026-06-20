@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sealant_protocol::{
-    CaptureMethod, CaptureMode, Confidence, ControlError, Encoding, EventPayload, ExecAccepted,
-    ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId, ProcessStarted, ProcessState,
-    ProcessSummary, RequestId, Signal, StreamKind, StreamOffset,
+    CaptureMethod, CaptureMode, Confidence, ControlError, ControlErrorCode, Encoding, EventPayload,
+    ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId, ProcessStarted,
+    ProcessState, ProcessSummary, RequestId, Signal, StreamKind, StreamOffset, TransformMeta,
 };
-use sealant_runtime_core::{Clock, IdGenerator, RuntimeConfig, RuntimeStatus};
+use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use std::os::unix::process::ExitStatusExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -35,6 +35,8 @@ pub struct ProcessRuntime {
     /// Extra environment injected into every child last (e.g. egress-proxy routing); the sandbox
     /// controls these so a request cannot override them.
     pub extra_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Secret redactor applied to captured I/O.
+    pub redactor: Arc<Redactor>,
 }
 
 fn validate_env(env: &[sealant_protocol::EnvVar]) -> Result<(), ControlError> {
@@ -70,6 +72,18 @@ impl ProcessRuntime {
             ));
         }
         validate_env(&args.env)?;
+
+        // Enforce the process limit before spawning; overflow is rejected cleanly, not crashed.
+        let active = self.status.counts().0;
+        if active >= self.config.limits.max_processes {
+            return Err(ControlError::new(
+                ControlErrorCode::PolicyDenied,
+                format!(
+                    "process limit reached ({}/{})",
+                    active, self.config.limits.max_processes
+                ),
+            ));
+        }
 
         let cwd = args
             .cwd
@@ -168,6 +182,8 @@ impl ProcessRuntime {
                 chunk_size,
                 bus,
                 corr,
+                self.redactor.clone(),
+                self.status.clone(),
             ))
         });
         let stderr_handle = stderr.map(|s| {
@@ -180,6 +196,8 @@ impl ProcessRuntime {
                 chunk_size,
                 bus,
                 corr,
+                self.redactor.clone(),
+                self.status.clone(),
             ))
         });
 
@@ -380,6 +398,10 @@ async fn run_to_exit(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "captured pipe needs full context per task"
+)]
 async fn capture_stream<R: AsyncRead + Unpin>(
     mut reader: R,
     stream: StreamKind,
@@ -387,6 +409,8 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     chunk_size: usize,
     bus: Arc<EventBus>,
     correlation: Correlation,
+    redactor: Arc<Redactor>,
+    status: Arc<RuntimeStatus>,
 ) {
     // Even when disabled we must drain the pipe so the child does not block on a full buffer.
     if matches!(mode, CaptureMode::Disabled) {
@@ -408,10 +432,30 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             Ok(n) => n,
             Err(_) => break,
         };
-        let content = if matches!(mode, CaptureMode::Full) {
-            Some(sealant_protocol::Base64Bytes::new(&buf[..n]))
+        let (content, byte_count, transform) = if matches!(mode, CaptureMode::Full) {
+            let (data, redacted) = redactor.redact(&buf[..n]);
+            if redacted > 0 {
+                status.add_redacted(redacted);
+                let len = data.len() as u64;
+                (
+                    Some(sealant_protocol::Base64Bytes::new(data)),
+                    len,
+                    Some(TransformMeta {
+                        redacted: true,
+                        truncated: false,
+                        coalesced: false,
+                        original_byte_count: Some(n as u64),
+                    }),
+                )
+            } else {
+                (
+                    Some(sealant_protocol::Base64Bytes::new(&buf[..n])),
+                    n as u64,
+                    None,
+                )
+            }
         } else {
-            None
+            (None, n as u64, None)
         };
         bus.publish(
             &correlation,
@@ -420,11 +464,11 @@ async fn capture_stream<R: AsyncRead + Unpin>(
             EventPayload::IoChunk(IoChunk {
                 stream,
                 encoding: Encoding::Base64,
-                byte_count: n as u64,
+                byte_count,
                 stream_offset: offset,
                 content,
                 artifact: None,
-                transform: None,
+                transform,
             }),
         );
         offset = offset.advance(n as u64);
@@ -460,6 +504,7 @@ mod tests {
             clock,
             config: Arc::new(config),
             extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            redactor: Arc::new(Redactor::default()),
         }
     }
 
@@ -534,6 +579,58 @@ mod tests {
         // Registry is cleaned up.
         assert_eq!(rt.registry.len(), 0);
         assert_eq!(rt.status.counts().0, 0);
+    }
+
+    #[tokio::test]
+    async fn redacts_secret_tokens_in_captured_output() {
+        let rt = runtime();
+        let mut rx = rt.bus.subscribe();
+        rt.exec(
+            exec_args(
+                "/bin/sh",
+                &["-c", "printf 'KEY=sk-abcdef012345678901234567'"],
+            ),
+            None,
+        )
+        .expect("spawn");
+        let payloads = collect_until_exit(&mut rx).await;
+        let chunks: Vec<_> = payloads
+            .iter()
+            .filter_map(|p| match p {
+                EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let combined: Vec<u8> = chunks
+            .iter()
+            .filter_map(|c| c.content.as_ref().map(|b| b.as_slice().to_vec()))
+            .flatten()
+            .collect();
+        let text = String::from_utf8_lossy(&combined);
+        assert!(!text.contains("sk-abcdef"), "secret leaked: {text}");
+        assert!(
+            text.contains("***REDACTED***"),
+            "no redaction marker: {text}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.transform.as_ref().is_some_and(|t| t.redacted))
+        );
+        assert!(rt.status.redacted() >= 1);
+    }
+
+    #[tokio::test]
+    async fn enforces_process_limit() {
+        let rt = runtime();
+        let max = rt.config.limits.max_processes;
+        for _ in 0..max {
+            rt.status.inc_processes();
+        }
+        let error = rt
+            .exec(exec_args("/bin/echo", &["x"]), None)
+            .expect_err("limit should reject");
+        assert_eq!(error.code(), ControlErrorCode::PolicyDenied);
     }
 
     #[tokio::test]

@@ -148,10 +148,29 @@ uncertainty represented honestly (proxy = observed; privileged degraded, not fak
 privilege never crashes ✅. Raw TCP/UDP + kernel DNS sniffing remain privileged-mode (documented as
 unavailable without caps); proxied DNS resolution is captured as `resolvedIps`.
 
-Still **Designed-only** (future phases): security hardening (SEC-*: peer-cred validation, capability
-drop, fuzzers). Optional: client-ack true-at-least-once, retry/backoff to an external sink,
-full-screen-app soak, per-process pidfd signalling, resource sampling, pty.input redaction (Phase 7),
-filesystem diff artifacts, privileged eBPF/netlink network backend.
+**Phase 7 — Security & hardening (complete; exit gate met).**
+- **Peer-credential validation** (`sealant-control::peer`): the control socket is `0600` *and*
+  rejects unauthorized peers by uid via `SO_PEERCRED` (Linux), **failing closed** if the uid can't
+  be determined; same-uid + root + an explicit `allowed_peer_uids` allowlist pass. Pure policy unit
+  tested; the `getsockopt` path validated on linux/amd64.
+- **Limits enforced, overflow graceful**: `exec`/`openSession` reject at `max_processes` /
+  `max_sessions` with `policy-denied` (no crash, no unbounded growth).
+- **Redaction** (`sealant-runtime-core::Redactor`): captured I/O is scanned for configured literal
+  secrets (values of secret-looking env vars) and high-confidence token shapes (`sk-`, `ghp_`,
+  `AKIA`, …); masked spans become `***REDACTED***` with `transform.redacted = true` and bump the
+  `redactedEvents` health counter. Binary-safe; never silent.
+- **No-new-privs**: `PR_SET_NO_NEW_PRIVS` at startup so children can't escalate via setuid binaries.
+- **Fuzzing**: a `fuzz/` cargo-fuzz crate (libFuzzer targets for `decode_client`/`decode_server`/
+  `decode_event`) for CI, plus an in-gate seeded robustness test (`decoders_never_panic_on_arbitrary_input`,
+  60k random + bit-flipped-valid inputs) that runs clean in `cargo test`.
+
+Exit gate (plan §22 Phase 7): untrusted clients rejected ✅; limits enforced + overflow graceful ✅;
+redaction works ✅; fuzz/robustness targets run clean for a budget ✅.
+
+Still **Designed-only** / optional (future): client-ack true-at-least-once, retry/backoff to an
+external sink, full-screen-app soak, per-process pidfd signalling, resource sampling, pty.input
+redaction, filesystem diff artifacts, privileged eBPF/netlink network backend, Linux capability
+dropping (the unprivileged sandbox holds no caps to drop).
 
 ---
 

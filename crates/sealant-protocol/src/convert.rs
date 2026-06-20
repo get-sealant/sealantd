@@ -1415,4 +1415,43 @@ mod tests {
         let bytes = encode_server(&msg);
         assert_eq!(decode_server(&bytes).expect("decode"), msg);
     }
+
+    /// In-repo fuzz harness (plan §22 Phase 7): the control-protocol decoders are the untrusted
+    /// attack surface. Hammer them with a seeded budget of random and bit-flipped-valid inputs; a
+    /// panic (or abort) here fails the test. Deeper fuzzing lives in `fuzz/` (cargo-fuzz).
+    #[test]
+    fn decoders_never_panic_on_arbitrary_input() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // a) Purely random buffers of varying length.
+        for _ in 0..30_000 {
+            let len = (next() % 600) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let _ = decode_client(&buf);
+            let _ = decode_server(&buf);
+            let _ = decode_event(&buf);
+        }
+
+        // b) Bit-flipped near-valid messages (exercise structured-but-corrupt inputs).
+        let valid = encode_client(&ClientMessage::Request(ControlRequest::new(
+            RequestId::new("r"),
+            Command::RuntimeHealth,
+        )));
+        for _ in 0..30_000 {
+            let mut buf = valid.clone();
+            if !buf.is_empty() {
+                let idx = (next() as usize) % buf.len();
+                buf[idx] ^= 1u8 << (next() % 8);
+            }
+            let _ = decode_client(&buf);
+            let _ = decode_server(&buf);
+            let _ = decode_event(&buf);
+        }
+    }
 }

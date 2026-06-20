@@ -143,6 +143,17 @@ impl SessionRuntime {
     /// # Errors
     /// Returns a [`ControlError`] if the PTY cannot be allocated or the shell cannot start.
     pub fn open(&self, args: OpenSessionArgs) -> Result<SessionOpened, ControlError> {
+        // Enforce the session limit before allocating a PTY; overflow is rejected cleanly.
+        let active = self.status.counts().1;
+        if active >= self.config.limits.max_sessions {
+            return Err(ControlError::new(
+                sealant_protocol::ControlErrorCode::PolicyDenied,
+                format!(
+                    "session limit reached ({}/{})",
+                    active, self.config.limits.max_sessions
+                ),
+            ));
+        }
         let shell = args
             .shell
             .clone()
