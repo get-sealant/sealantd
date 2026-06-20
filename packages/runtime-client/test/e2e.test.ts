@@ -11,12 +11,12 @@ import { rmSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import type { ChildProcess } from "node:child_process";
 
-import { SealantClient, SealantError } from "../src/client.ts";
+import { SealantClient, SealantError } from "@sealant/runtime-client";
 import {
   ControlErrorCode,
   RuntimeState,
   StreamKind,
-} from "../../runtime-protocol/src/index.ts";
+} from "@sealant/runtime-protocol";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");

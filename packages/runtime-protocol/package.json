@@ -1,15 +1,19 @@
 {
   "name": "@sealant/runtime-protocol",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Typed Protobuf wire codec + framing for the sealantd control protocol.",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/get-sealant/sealantd.git", "directory": "packages/runtime-protocol" },
   "type": "module",
-  "exports": {
-    ".": "./src/index.ts"
-  },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "generate": "buf generate",
-    "lint": "oxlint .",
-    "typecheck": "tsgo -p tsconfig.json --noEmit"
+    "clean": "rm -rf dist",
+    "lint": "oxlint ."
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.0"

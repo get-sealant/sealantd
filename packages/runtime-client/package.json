@@ -1,18 +1,22 @@
 {
   "name": "@sealant/runtime-client",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Ergonomic, typed TypeScript client for the sealantd runtime daemon.",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/get-sealant/sealantd.git", "directory": "packages/runtime-client" },
   "type": "module",
-  "exports": {
-    ".": "./src/index.ts"
-  },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
   "scripts": {
-    "test": "node --experimental-transform-types --test test/*.test.ts",
-    "lint": "oxlint .",
-    "typecheck": "tsgo -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.ts",
+    "clean": "rm -rf dist",
+    "lint": "oxlint ."
   },
   "dependencies": {
-    "@sealant/runtime-protocol": "workspace:*",
+    "@sealant/runtime-protocol": "workspace:^",
     "@bufbuild/protobuf": "^2.12.0"
   }
 }

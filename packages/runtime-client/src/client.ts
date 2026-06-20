@@ -10,6 +10,7 @@ import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { setTimeout as delay } from "node:timers/promises";
+import type { MessageInitShape } from "@bufbuild/protobuf";
 
 import {
   create,
@@ -18,20 +19,19 @@ import {
   FrameDecoder,
   SCHEMA_VERSION,
   ClientMessageSchema,
+  CommandSchema,
   ControlErrorCode,
-  type Command,
   type CommandResult,
   type Capabilities,
   type ControlError,
   type ControlResponse,
   type EventEnvelope,
   type ExecAccepted,
-  type ExecArgs,
   type HealthReport,
   type ProcessList,
   type RuntimeMetrics,
   type ServerMessage,
-} from "../../runtime-protocol/src/index.ts";
+} from "@sealant/runtime-protocol";
 
 /** Error raised when the daemon returns a typed control error. */
 export class SealantError extends Error {
@@ -52,8 +52,8 @@ type Pending = {
   reject: (error: Error) => void;
 };
 
-/** A oneof case of the `Command` message. */
-type CommandCase = Command["command"];
+/** The init shape of the `Command` oneof (what callers pass to {@link SealantClient.request}). */
+type CommandInit = MessageInitShape<typeof CommandSchema>["command"];
 
 /** Throw on an error outcome; otherwise return the `CommandResult`. */
 function okResult(response: ControlResponse): CommandResult {
@@ -68,15 +68,13 @@ function okResult(response: ControlResponse): CommandResult {
   throw new Error("response had no outcome");
 }
 
-/** Narrow a `CommandResult` to a specific result case, or throw. */
-function expect<C extends CommandResult["result"]["case"]>(
-  result: CommandResult,
-  kase: C,
-): Extract<CommandResult["result"], { case: C }>["value"] {
+/** Assert the `CommandResult` is a specific result case and return its (untyped) value. The caller
+ * casts to the exact result type — the public method signatures are the typed contract. */
+function resultValue(result: CommandResult, kase: CommandResult["result"]["case"]): unknown {
   if (result.result.case !== kase) {
     throw new Error(`expected result ${kase}, got ${String(result.result.case)}`);
   }
-  return result.result.value as Extract<CommandResult["result"], { case: C }>["value"];
+  return (result.result as { value: unknown }).value;
 }
 
 /** Options for {@link SealantClient.exec} (a subset of the wire `ExecArgs`). */
@@ -154,7 +152,7 @@ export class SealantClient {
   }
 
   /** Send a command oneof case and await its single (typed) response. */
-  request(command: CommandCase): Promise<ControlResponse> {
+  request(command: CommandInit): Promise<ControlResponse> {
     if (this.#closed) {
       return Promise.reject(new Error("client is closed"));
     }
@@ -178,37 +176,44 @@ export class SealantClient {
   }
 
   async health(): Promise<HealthReport> {
-    return expect(okResult(await this.request({ case: "runtimeHealth", value: {} })), "health");
+    return resultValue(okResult(await this.request({ case: "runtimeHealth", value: {} })), "health") as HealthReport;
   }
 
   async getCapabilities(): Promise<Capabilities> {
-    return expect(
+    return resultValue(
       okResult(await this.request({ case: "runtimeGetCapabilities", value: {} })),
       "capabilities",
-    );
+    ) as Capabilities;
   }
 
   async getMetrics(): Promise<RuntimeMetrics> {
-    return expect(okResult(await this.request({ case: "getRuntimeMetrics", value: {} })), "metrics");
+    return resultValue(okResult(await this.request({ case: "getRuntimeMetrics", value: {} })), "metrics") as RuntimeMetrics;
   }
 
   async listProcesses(executionId?: string): Promise<ProcessList> {
     const value = executionId === undefined ? {} : { executionId };
-    return expect(okResult(await this.request({ case: "listProcesses", value })), "processList");
+    return resultValue(okResult(await this.request({ case: "listProcesses", value })), "processList") as ProcessList;
   }
 
   async exec(options: ExecOptions): Promise<ExecAccepted> {
-    const value: Partial<ExecArgs> = {
-      executable: options.executable,
-      args: options.args ?? [],
-      executionId: options.executionId,
-      sessionId: options.sessionId,
-      cwd: options.cwd,
-      stdin: options.stdin ?? false,
-      timeoutMillis: options.timeoutMillis,
-      background: options.background ?? false,
-    };
-    return expect(okResult(await this.request({ case: "exec", value })), "execAccepted");
+    const result = okResult(
+      await this.request({
+        case: "exec",
+        value: {
+          executable: options.executable,
+          args: options.args ?? [],
+          executionId: options.executionId,
+          sessionId: options.sessionId,
+          cwd: options.cwd,
+          stdin: options.stdin ?? false,
+          // 64-bit wire fields are bigint in protobuf-es.
+          timeoutMillis:
+            options.timeoutMillis === undefined ? undefined : BigInt(options.timeoutMillis),
+          background: options.background ?? false,
+        },
+      }),
+    );
+    return resultValue(result, "execAccepted") as ExecAccepted;
   }
 
   async writeStdin(processId: string, data: Uint8Array): Promise<void> {
@@ -220,7 +225,7 @@ export class SealantClient {
   }
 
   async shutdown(graceMillis?: number): Promise<void> {
-    const value = graceMillis === undefined ? {} : { graceMillis };
+    const value = graceMillis === undefined ? {} : { graceMillis: BigInt(graceMillis) };
     okResult(await this.request({ case: "runtimeGracefulShutdown", value }));
   }
 

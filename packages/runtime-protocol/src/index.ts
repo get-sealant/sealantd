@@ -18,10 +18,10 @@ import {
   type ClientMessage,
   type ServerMessage,
   type EventEnvelope,
-} from "./gen/sealant_pb.ts";
+} from "./gen/sealant_pb.js";
 
 // Re-export the full generated surface (types, enums, schemas) plus protobuf-es `create`.
-export * from "./gen/sealant_pb.ts";
+export * from "./gen/sealant_pb.js";
 export { create } from "@bufbuild/protobuf";
 
 /** Current wire schema version. */
