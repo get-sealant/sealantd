@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted, 2026-06-20
+Accepted, 2026-06-20. **Superseded in part by [ADR-0012](0012-protobuf-wire-format.md)**
+(2026-06-20): the message *encoding* moves from framed JSON to Protobuf + Buf before
+any external SDK ships, to enable typed multi-language SDKs. The length-prefixed
+**framing** and the single-schema-source principle described here are retained.
 
 ## Context
 

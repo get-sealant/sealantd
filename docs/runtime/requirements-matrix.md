@@ -97,6 +97,14 @@ Exit gate (plan §22 Phase 4): slow sinks don't grow memory (bounded queue + dro
 restart replays un-acked events ✅; corrupt/partial records deterministic ✅; critical loss never
 silent ✅.
 
+**Scheduled — protocol-format migration (ADR-0012).** A benchmark
+(`spikes/wire-bench/`) showed framed JSON is ~33% larger and ~20–30× slower to encode on
+the high-volume I/O path, and that the product wants typed multi-language SDKs from day 0.
+Decision: migrate the wire **encoding** from framed JSON to **Protobuf + Buf** (framing
+unchanged), keeping a debug Protobuf→JSON view. Runs as a dedicated, mechanical pass
+(~1–2 days, isolated to `sealant-protocol` + the ~5 encode/decode sites + the TS packages
++ wire-shape tests) **before any external SDK ships** — after the in-flight feature phases.
+
 Still **Designed-only** (future phases): filesystem telemetry (FS-*), network telemetry (NET-*),
 security hardening (SEC-*: peer-cred validation, capability drop, fuzzers). Optional: client-ack
 true-at-least-once, retry/backoff to an external sink, full-screen-app soak, per-process pidfd

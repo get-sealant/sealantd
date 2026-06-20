@@ -1,0 +1,20 @@
+syntax = "proto3";
+package wirebench;
+
+message Envelope {
+  uint32 schema_version = 1;
+  string event_id = 2;
+  string runtime_id = 3;
+  optional string execution_id = 4;
+  optional string process_id = 5;
+  uint64 sequence = 6;
+  int64 observed_at = 7;
+  uint64 monotonic = 8;
+  string capture_method = 9;
+  string confidence = 10;
+  string event_type = 11;
+  string stream = 12;
+  uint64 byte_count = 13;
+  uint64 stream_offset = 14;
+  bytes content = 15;
+}

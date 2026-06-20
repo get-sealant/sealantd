@@ -13,5 +13,6 @@
 | [0009](0009-network-collector-backends-and-privilege-separation.md) | Network collector backends and privilege separation |
 | [0010](0010-typescript-type-generation-and-compatibility.md) | TypeScript type generation and compatibility |
 | [0011](0011-packaging-static-musl-amd64.md) | Packaging: static musl, amd64-first |
+| [0012](0012-protobuf-wire-format.md) | Protobuf wire format (supersedes 0002 encoding) |
 
 ADR template: Status, Context, Decision, Consequences, Alternatives considered.
