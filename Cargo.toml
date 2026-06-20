@@ -66,4 +66,8 @@ sealant-network = { path = "crates/sealant-network" }
 sealant-control = { path = "crates/sealant-control" }
 
 [profile.release]
-debug = "line-tables-only"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"

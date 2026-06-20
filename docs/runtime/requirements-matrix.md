@@ -167,6 +167,43 @@ unavailable without caps); proxied DNS resolution is captured as `resolvedIps`.
 Exit gate (plan §22 Phase 7): untrusted clients rejected ✅; limits enforced + overflow graceful ✅;
 redaction works ✅; fuzz/robustness targets run clean for a budget ✅.
 
+**Phase 8 — Packaging & final integration (complete; exit gate met).**
+- **Static multi-arch artifacts**: `[profile.release]` (thin-LTO, 1 codegen unit, stripped) + a musl
+  build. Verified `aarch64-unknown-linux-musl` builds **statically linked** (`file`: "statically
+  linked", `ldd`: "not a dynamic executable", ~2.7 MiB) and smoke-passes (`--print-capabilities`).
+  `scripts/build-release.sh` produces both arches; protoc is vendored so no system dependency.
+- **BuildKit stage**: `docker/Dockerfile` — multi-stage musl build → single static binary on
+  `scratch`; `docker buildx --platform linux/amd64,linux/arm64` builds each arch natively.
+- **TypeScript SDK**: `@sealant/runtime-protocol` + `@sealant/runtime-client` on the protobuf wire
+  (Phase: protobuf migration); Node e2e green.
+- **Example**: `examples/demo.sh` runs end-to-end (build → start → health → capabilities → exec with
+  streamed telemetry → graceful shutdown); verified.
+- **Docs**: `operations.md` (flags/config/deploy/security), `benchmarks.md` (wire + artifact +
+  runtime measurements). This matrix is the requirements traceability.
+
+Exit gate (plan §22 Phase 8): static linking verified ✅; arch builds + smoke (aarch64 native here;
+amd64 via the same musl path under buildx) ✅; example runs end-to-end ✅; docs + traceability
+complete ✅.
+
+### Brief → code traceability (final)
+
+| Area | Crate / artifact |
+|------|------------------|
+| Wire protocol, ids, events, errors | `sealant-protocol` (+ `proto/sealant.proto`, ADR-0012) |
+| Config, state, policy, health, redaction | `sealant-runtime-core` |
+| Exec, groups, pidfd, reaping | `sealant-process` |
+| PTY sessions, ctty, resize | `sealant-pty` |
+| Event bus, sequencing, backpressure | `sealant-telemetry` |
+| Durable spool, CRC, recovery, rotation | `sealant-eventlog` |
+| Filesystem snapshot/watch/diff | `sealant-fs` |
+| Network egress proxy, capability, sources | `sealant-network` |
+| Socket, framing, peer validation, dispatch | `sealant-control` |
+| Binary composition, lifecycle | `sealantd` |
+| Debug client | `sealantctl` |
+| TypeScript SDK | `packages/runtime-protocol`, `packages/runtime-client` |
+| Fuzzing | `fuzz/` + in-gate robustness test |
+| Packaging | `docker/Dockerfile`, `scripts/build-release.sh`, `examples/demo.sh` |
+
 Still **Designed-only** / optional (future): client-ack true-at-least-once, retry/backoff to an
 external sink, full-screen-app soak, per-process pidfd signalling, resource sampling, pty.input
 redaction, filesystem diff artifacts, privileged eBPF/netlink network backend, Linux capability
