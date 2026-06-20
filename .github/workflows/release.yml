@@ -57,11 +57,13 @@ jobs:
       id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
     steps:
       - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v5
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
+      # pnpm comes from package.json#packageManager (pnpm@11.1.0) via Corepack, which ships with
+      # Node — so there is no extra action running on the deprecated Node 20 action runtime.
+      - run: corepack enable
       # --ignore-scripts: never run dependency lifecycle scripts in the publish job. The build below
       # needs none (codegen is committed; build is just tsc).
       - run: pnpm install --frozen-lockfile --ignore-scripts
