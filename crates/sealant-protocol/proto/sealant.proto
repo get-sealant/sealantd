@@ -268,6 +268,34 @@ message FileWatchOverflow { string root = 1; }
 message FileSnapshotCompleted { string root = 1; uint64 file_count = 2; }
 message FileDiffAvailable { uint64 added = 1; uint64 modified = 2; uint64 deleted = 3; uint64 renamed = 4; }
 
+enum NetworkScheme {
+  NETWORK_SCHEME_UNSPECIFIED = 0;
+  NETWORK_SCHEME_HTTP = 1;
+  NETWORK_SCHEME_HTTPS_CONNECT = 2;
+}
+
+message NetworkRequest {
+  NetworkScheme scheme = 1;
+  optional string method = 2;
+  string host = 3;
+  uint32 port = 4;
+  optional string path = 5;
+  optional uint32 status = 6;
+  uint64 bytes_sent = 7;
+  uint64 bytes_received = 8;
+  uint64 duration_micros = 9;
+}
+
+message NetworkSourceObserved {
+  string host = 1;
+  repeated string resolved_ips = 2;
+  uint32 port = 3;
+  optional NetworkScheme scheme = 4;
+  optional string method = 5;
+  optional string path = 6;
+  optional uint32 status = 7;
+}
+
 message EventEnvelope {
   uint32 schema_version = 1;
   string event_id = 2;
@@ -292,6 +320,8 @@ message EventEnvelope {
     FileWatchOverflow file_watch_overflow = 27;
     FileSnapshotCompleted file_snapshot_completed = 28;
     FileDiffAvailable file_diff_available = 29;
+    NetworkRequest network_request = 30;
+    NetworkSourceObserved network_source_observed = 31;
   }
 }
 

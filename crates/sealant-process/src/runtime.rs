@@ -32,6 +32,9 @@ pub struct ProcessRuntime {
     pub clock: Arc<Clock>,
     /// Runtime configuration.
     pub config: Arc<RuntimeConfig>,
+    /// Extra environment injected into every child last (e.g. egress-proxy routing); the sandbox
+    /// controls these so a request cannot override them.
+    pub extra_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 fn validate_env(env: &[sealant_protocol::EnvVar]) -> Result<(), ControlError> {
@@ -81,6 +84,14 @@ impl ProcessRuntime {
         }
         for var in &args.env {
             command.env(&var.key, &var.value);
+        }
+        for (key, value) in self
+            .extra_env
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            command.env(key, value);
         }
         command.current_dir(&cwd);
         command.stdin(if args.stdin {
@@ -448,6 +459,7 @@ mod tests {
             status: Arc::new(RuntimeStatus::new()),
             clock,
             config: Arc::new(config),
+            extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 

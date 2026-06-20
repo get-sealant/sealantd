@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use sealant_protocol::{
-    CapturePolicy, DEFAULT_MAX_FRAME_BYTES, EnvVar, ExecutionId, Limits, RuntimeId,
+    CapturePolicy, DEFAULT_MAX_FRAME_BYTES, EnvVar, ExecutionId, Limits, NetworkMode, RuntimeId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -62,6 +62,9 @@ pub struct RuntimeConfig {
     /// Whether to observe the workspace filesystem (baseline snapshot + live watch + final diff).
     #[serde(default)]
     pub watch_filesystem: bool,
+    /// Requested network observation mode (may be degraded by capability detection).
+    #[serde(default)]
+    pub network_mode: NetworkMode,
 }
 
 /// Default bounded limits for the smallest sandbox.
@@ -100,6 +103,7 @@ impl RuntimeConfig {
             spool_dir: None,
             log_level: "info".to_owned(),
             watch_filesystem: false,
+            network_mode: NetworkMode::Off,
         }
     }
 

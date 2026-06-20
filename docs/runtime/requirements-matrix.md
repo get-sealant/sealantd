@@ -126,10 +126,32 @@ wrapping (ADR-0010), and `buf generate` clients for other languages.
 Exit gate (plan §22 Phase 5): create/modify/delete/rename ✅; editor temp files coalesced ✅;
 overflow emits an event + rescan ✅; symlink/path-boundary safe ✅.
 
-Still **Designed-only** (future phases): network telemetry (NET-*), security hardening
-(SEC-*: peer-cred validation, capability drop, fuzzers). Optional: client-ack true-at-least-once,
-retry/backoff to an external sink, full-screen-app soak, per-process pidfd signalling, resource
-sampling, pty.input redaction (Phase 7), filesystem diff artifacts for large patches.
+**Phase 6 — Network telemetry (complete; exit gate met).** New crate `sealant-network`.
+- **Explicit egress proxy** (the honest, unprivileged path): observes plain-HTTP request metadata
+  (method/host/path/status/bytes/duration) and HTTPS `CONNECT` tunnels (host/port/byte-counts via
+  `copy_bidirectional`; encrypted body never inspected). Children are routed through it via
+  `HTTP_PROXY`/`HTTPS_PROXY`, injected into the child env **last** so a request cannot override
+  sandbox egress routing.
+- **Capability detection** (`detect_mode`): privileged/metadata raw-socket backends need
+  `CAP_NET_ADMIN`/`CAP_BPF` the sandbox does not convey, so they **degrade to the userspace proxy**
+  rather than failing; missing privilege never crashes the daemon.
+- **Source normalization**: each observation emits `network.request` evidence + a normalized
+  `network.sourceObserved` (host, resolved IPs = DNS evidence, scheme/method/path/status).
+- **Degraded fallback**: if the proxy can't bind, mode degrades to `Off`. `--print-capabilities`
+  reports the *detected* mode (pre-flight); the live daemon reports the effective mode.
+- Wired into the daemon behind `--network-proxy`; `capabilities.features.network` reflects the mode.
+- Tests: proxy HTTP (origin fixture) + CONNECT (echo fixture) emit correct evidence; capability
+  degradation. Validated end-to-end through the daemon (child request → `network.request`/`source`).
+
+Exit gate (plan §22 Phase 6): HTTP + HTTPS-CONNECT fixtures produce correct evidence ✅; attribution
+uncertainty represented honestly (proxy = observed; privileged degraded, not faked) ✅; missing
+privilege never crashes ✅. Raw TCP/UDP + kernel DNS sniffing remain privileged-mode (documented as
+unavailable without caps); proxied DNS resolution is captured as `resolvedIps`.
+
+Still **Designed-only** (future phases): security hardening (SEC-*: peer-cred validation, capability
+drop, fuzzers). Optional: client-ack true-at-least-once, retry/backoff to an external sink,
+full-screen-app soak, per-process pidfd signalling, resource sampling, pty.input redaction (Phase 7),
+filesystem diff artifacts, privileged eBPF/netlink network backend.
 
 ---
 

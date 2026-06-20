@@ -386,6 +386,69 @@ pub struct FileDiffAvailable {
     pub renamed: u64,
 }
 
+/// Observed network scheme (plan §14).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkScheme {
+    /// Plain HTTP observed via the explicit proxy.
+    Http,
+    /// HTTPS via an `HTTP CONNECT` tunnel — host and port observable, encrypted body is not.
+    HttpsConnect,
+}
+
+/// Payload for `network.request`: an egress request observed by the explicit proxy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkRequest {
+    /// Scheme.
+    pub scheme: NetworkScheme,
+    /// HTTP method, when observable (absent for CONNECT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Destination host.
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// Request path, when observable (absent for CONNECT — encrypted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Response status, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u32>,
+    /// Bytes sent to the destination.
+    pub bytes_sent: u64,
+    /// Bytes received from the destination.
+    pub bytes_received: u64,
+    /// Total request duration in microseconds.
+    pub duration_micros: u64,
+}
+
+/// Payload for `network.sourceObserved`: a normalized network source (plan §14.5). The SDK decides
+/// whether this evidence represents a source actually used by an LLM task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkSourceObserved {
+    /// Host.
+    pub host: String,
+    /// Resolved IPs, when known.
+    #[serde(default)]
+    pub resolved_ips: Vec<String>,
+    /// Port.
+    pub port: u16,
+    /// Scheme, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<NetworkScheme>,
+    /// HTTP method, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// URL path, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Response status, when observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u32>,
+}
+
 /// The typed, internally-tagged telemetry payload. The tag field is `eventType`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "eventType")]
@@ -420,6 +483,12 @@ pub enum EventPayload {
     /// A baseline→final diff summary is available.
     #[serde(rename = "file.diffAvailable")]
     FileDiffAvailable(FileDiffAvailable),
+    /// An egress request was observed by the explicit proxy.
+    #[serde(rename = "network.request")]
+    NetworkRequest(NetworkRequest),
+    /// A normalized network source was observed.
+    #[serde(rename = "network.sourceObserved")]
+    NetworkSourceObserved(NetworkSourceObserved),
 }
 
 impl EventPayload {
@@ -437,6 +506,8 @@ impl EventPayload {
             Self::FileWatchOverflow(_) => "file.watchOverflow",
             Self::FileSnapshotCompleted(_) => "file.snapshotCompleted",
             Self::FileDiffAvailable(_) => "file.diffAvailable",
+            Self::NetworkRequest(_) => "network.request",
+            Self::NetworkSourceObserved(_) => "network.sourceObserved",
         }
     }
 
@@ -450,9 +521,11 @@ impl EventPayload {
             | Self::TelemetryDropped(_)
             | Self::FileWatchOverflow(_)
             | Self::FileDiffAvailable(_) => EventPriority::Critical,
-            Self::IoChunk(_) | Self::FileChange(_) | Self::FileSnapshotCompleted(_) => {
-                EventPriority::Normal
-            }
+            Self::IoChunk(_)
+            | Self::FileChange(_)
+            | Self::FileSnapshotCompleted(_)
+            | Self::NetworkRequest(_)
+            | Self::NetworkSourceObserved(_) => EventPriority::Normal,
             Self::RuntimeHeartbeat(_) => EventPriority::Low,
         }
     }

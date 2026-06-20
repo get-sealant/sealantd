@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use sealant_control::{serve_stdio, serve_unix};
-use sealant_protocol::RuntimeState;
+use sealant_protocol::{NetworkMode, RuntimeState};
 use sealant_runtime_core::{RuntimeConfig, new_runtime_id};
 use tokio::sync::watch;
 
@@ -32,6 +32,9 @@ struct Cli {
     /// Observe the workspace filesystem (baseline snapshot + live watch + final diff).
     #[arg(long)]
     watch_filesystem: bool,
+    /// Route child egress through an explicit local proxy and observe HTTP/CONNECT metadata.
+    #[arg(long)]
+    network_proxy: bool,
     /// Bound sandbox id.
     #[arg(long)]
     sandbox_id: Option<String>,
@@ -65,6 +68,9 @@ fn build_config(cli: &Cli) -> RuntimeConfig {
     }
     if cli.watch_filesystem {
         config.watch_filesystem = true;
+    }
+    if cli.network_proxy {
+        config.network_mode = NetworkMode::Proxy;
     }
     if let Some(sandbox_id) = &cli.sandbox_id {
         config.sandbox_id = Some(sandbox_id.clone());
@@ -183,6 +189,11 @@ async fn serve(cli: Cli, runtime: Arc<Runtime>) -> ExitCode {
     runtime.start_telemetry();
     // Begin filesystem observation if enabled (no-op otherwise).
     runtime.start_filesystem();
+    // Start network observation if requested (injects proxy routing into the child env).
+    let network_mode = runtime.start_network().await;
+    if network_mode != NetworkMode::Off {
+        tracing::info!(?network_mode, "network observation active");
+    }
 
     // Startup validation is complete; announce healthy before accepting work.
     runtime.mark_healthy();

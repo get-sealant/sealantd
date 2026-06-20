@@ -791,6 +791,13 @@ dependencies = [
 [[package]]
 name = "sealant-network"
 version = "0.0.0"
+dependencies = [
+ "sealant-protocol",
+ "sealant-runtime-core",
+ "sealant-telemetry",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "sealant-process"
@@ -876,6 +883,7 @@ dependencies = [
  "sealant-control",
  "sealant-eventlog",
  "sealant-fs",
+ "sealant-network",
  "sealant-process",
  "sealant-protocol",
  "sealant-pty",

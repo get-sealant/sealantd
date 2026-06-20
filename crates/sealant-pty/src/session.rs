@@ -128,6 +128,8 @@ pub struct SessionRuntime {
     pub clock: Arc<Clock>,
     /// Configuration.
     pub config: Arc<RuntimeConfig>,
+    /// Extra environment injected into every session child last (e.g. egress-proxy routing).
+    pub extra_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 fn signal_session(pid: i32, signal: NixSignal) {
@@ -157,6 +159,13 @@ impl SessionRuntime {
             .map(|v| (v.key.clone(), v.value.clone()))
             .collect();
         env.extend(args.env.iter().map(|v| (v.key.clone(), v.value.clone())));
+        env.extend(
+            self.extra_env
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
 
         let PtyChild { master, child, pid } = pty::spawn(
             &shell, &args.args, &cwd, &env, args.cols, args.rows, &term,
@@ -431,6 +440,7 @@ mod tests {
             status: Arc::new(RuntimeStatus::new()),
             clock,
             config: Arc::new(config),
+            extra_env: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 

@@ -17,6 +17,7 @@ sealant-eventlog = { workspace = true }
 sealant-process = { workspace = true }
 sealant-pty = { workspace = true }
 sealant-fs = { workspace = true }
+sealant-network = { workspace = true }
 sealant-control = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

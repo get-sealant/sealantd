@@ -9,6 +9,7 @@ use sealant_control::ControlService;
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
 use sealant_fs::snapshot::SnapshotConfig;
 use sealant_fs::{FilesystemConfig, FilesystemRuntime};
+use sealant_network::{NetworkConfig, NetworkRuntime};
 use sealant_process::{ProcessRegistry, ProcessRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
@@ -91,6 +92,8 @@ pub struct Runtime {
     processes: ProcessRuntime,
     sessions: SessionRuntime,
     filesystem: Arc<FilesystemRuntime>,
+    network: Arc<NetworkRuntime>,
+    extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
     pidfd_supported: bool,
@@ -106,6 +109,7 @@ impl Runtime {
         let idgen = Arc::new(IdGenerator::new(&config.runtime_id));
         let status = Arc::new(RuntimeStatus::new());
         let bus = build_bus(&config, &clock, &idgen);
+        let extra_env = Arc::new(Mutex::new(Vec::new()));
         let processes = ProcessRuntime {
             registry: Arc::new(ProcessRegistry::new()),
             bus: bus.clone(),
@@ -113,6 +117,7 @@ impl Runtime {
             status: status.clone(),
             clock: clock.clone(),
             config: config.clone(),
+            extra_env: extra_env.clone(),
         };
         let sessions = SessionRuntime {
             registry: Arc::new(SessionRegistry::new()),
@@ -121,12 +126,20 @@ impl Runtime {
             status: status.clone(),
             clock: clock.clone(),
             config: config.clone(),
+            extra_env: extra_env.clone(),
         };
         let filesystem = Arc::new(FilesystemRuntime::new(
             bus.clone(),
             FilesystemConfig {
                 root: config.workspace_root.clone(),
                 snapshot: SnapshotConfig::default(),
+                execution_id: config.default_execution_id.clone(),
+            },
+        ));
+        let network = Arc::new(NetworkRuntime::new(
+            bus.clone(),
+            NetworkConfig {
+                mode: config.network_mode,
                 execution_id: config.default_execution_id.clone(),
             },
         ));
@@ -143,6 +156,8 @@ impl Runtime {
             processes,
             sessions,
             filesystem,
+            network,
+            extra_env,
             shutdown,
             features: Mutex::new(default_feature_states()),
             pidfd_supported,
@@ -214,6 +229,17 @@ impl Runtime {
         }
     }
 
+    /// Start network observation if requested, and inject proxy routing into the child environment.
+    /// Returns the effective mode (degraded if privilege or binding is unavailable).
+    pub async fn start_network(&self) -> NetworkMode {
+        let mode = self.network.start().await;
+        let proxy_env = self.network.proxy_env();
+        if !proxy_env.is_empty() {
+            *self.extra_env.lock().unwrap_or_else(|e| e.into_inner()) = proxy_env;
+        }
+        mode
+    }
+
     /// Transition to healthy after startup validation. Emits `runtime.stateChanged`.
     pub fn mark_healthy(&self) {
         self.transition(RuntimeState::Healthy, None);
@@ -257,6 +283,8 @@ impl Runtime {
         );
         // Capture the final filesystem state (final snapshot + baseline→final diff).
         self.finalize_filesystem();
+        // Stop the egress proxy.
+        self.network.shutdown();
     }
 
     /// Finish shutdown: mark stopped.
@@ -322,7 +350,7 @@ impl Runtime {
                 io_capture: true,
                 pty: true,
                 filesystem: self.config.watch_filesystem,
-                network: NetworkMode::Off,
+                network: self.network.capability_mode(),
                 privileged: false,
                 pidfd: self.pidfd_supported,
                 subreaper: self.subreaper,

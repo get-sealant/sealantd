@@ -22,6 +22,7 @@ use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
     FileWatchOverflow,
 };
+use crate::{NetworkRequest, NetworkScheme, NetworkSourceObserved};
 
 /// Errors decoding a wire message into a domain type.
 #[derive(Debug, thiserror::Error)]
@@ -552,6 +553,73 @@ impl From<wire::FileDiffAvailable> for FileDiffAvailable {
     }
 }
 
+enum_pair!(
+    network_scheme,
+    NetworkScheme,
+    wire::NetworkScheme,
+    [Http, HttpsConnect]
+);
+
+impl From<NetworkRequest> for wire::NetworkRequest {
+    fn from(r: NetworkRequest) -> Self {
+        Self {
+            scheme: enum_i32::<_, wire::NetworkScheme>(r.scheme),
+            method: r.method,
+            host: r.host,
+            port: u32::from(r.port),
+            path: r.path,
+            status: r.status,
+            bytes_sent: r.bytes_sent,
+            bytes_received: r.bytes_received,
+            duration_micros: r.duration_micros,
+        }
+    }
+}
+impl TryFrom<wire::NetworkRequest> for NetworkRequest {
+    type Error = WireError;
+    fn try_from(r: wire::NetworkRequest) -> Result<Self, WireError> {
+        Ok(Self {
+            scheme: network_scheme(r.scheme)?,
+            method: r.method,
+            host: r.host,
+            port: r.port as u16,
+            path: r.path,
+            status: r.status,
+            bytes_sent: r.bytes_sent,
+            bytes_received: r.bytes_received,
+            duration_micros: r.duration_micros,
+        })
+    }
+}
+
+impl From<NetworkSourceObserved> for wire::NetworkSourceObserved {
+    fn from(s: NetworkSourceObserved) -> Self {
+        Self {
+            host: s.host,
+            resolved_ips: s.resolved_ips,
+            port: u32::from(s.port),
+            scheme: s.scheme.map(enum_i32::<_, wire::NetworkScheme>),
+            method: s.method,
+            path: s.path,
+            status: s.status,
+        }
+    }
+}
+impl TryFrom<wire::NetworkSourceObserved> for NetworkSourceObserved {
+    type Error = WireError;
+    fn try_from(s: wire::NetworkSourceObserved) -> Result<Self, WireError> {
+        Ok(Self {
+            host: s.host,
+            resolved_ips: s.resolved_ips,
+            port: s.port as u16,
+            scheme: s.scheme.map(network_scheme).transpose()?,
+            method: s.method,
+            path: s.path,
+            status: s.status,
+        })
+    }
+}
+
 impl From<EventPayload> for wire::event_envelope::Payload {
     fn from(p: EventPayload) -> Self {
         use wire::event_envelope::Payload as W;
@@ -573,6 +641,8 @@ impl From<EventPayload> for wire::event_envelope::Payload {
             EventPayload::FileWatchOverflow(o) => W::FileWatchOverflow(o.into()),
             EventPayload::FileSnapshotCompleted(s) => W::FileSnapshotCompleted(s.into()),
             EventPayload::FileDiffAvailable(d) => W::FileDiffAvailable(d.into()),
+            EventPayload::NetworkRequest(r) => W::NetworkRequest(r.into()),
+            EventPayload::NetworkSourceObserved(s) => W::NetworkSourceObserved(s.into()),
         }
     }
 }
@@ -596,6 +666,8 @@ impl TryFrom<wire::event_envelope::Payload> for EventPayload {
             W::FileWatchOverflow(o) => EventPayload::FileWatchOverflow(o.into()),
             W::FileSnapshotCompleted(s) => EventPayload::FileSnapshotCompleted(s.into()),
             W::FileDiffAvailable(d) => EventPayload::FileDiffAvailable(d.into()),
+            W::NetworkRequest(r) => EventPayload::NetworkRequest(r.try_into()?),
+            W::NetworkSourceObserved(s) => EventPayload::NetworkSourceObserved(s.try_into()?),
         })
     }
 }

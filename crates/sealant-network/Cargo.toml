@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Network telemetry: explicit egress proxy, capability detection, source normalization."
 
 [lints]
 workspace = true
+
+[dependencies]
+sealant-protocol = { workspace = true }
+sealant-telemetry = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+sealant-runtime-core = { workspace = true }

@@ -104,10 +104,11 @@ pub struct EnvVar {
 }
 
 /// Network observation mode reported in capabilities (plan §14).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum NetworkMode {
     /// No network observation.
+    #[default]
     Off,
     /// Best-effort DNS and connection metadata without elevated privilege.
     Metadata,
