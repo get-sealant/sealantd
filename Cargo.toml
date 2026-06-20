@@ -39,7 +39,7 @@ base64 = "0.22"
 crc32fast = "1"
 hex = "0.4"
 sha2 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 tempfile = "3"
 # filesystem telemetry (plan §13)
 notify = "6"
