@@ -47,6 +47,7 @@ libc = "0.2"
 # protobuf wire format (ADR-0012)
 prost = "0.13"
 prost-build = "0.13"
+protoc-bin-vendored = "3"
 # cli
 clap = { version = "4", features = ["derive"] }
 # internal crates

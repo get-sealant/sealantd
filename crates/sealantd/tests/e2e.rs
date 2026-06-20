@@ -38,7 +38,7 @@ fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
 }
 
 async fn send_request<W: AsyncWrite + Unpin>(writer: &mut W, request: ControlRequest) {
-    let body = serde_json::to_vec(&ClientMessage::Request(request)).expect("encode request");
+    let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
     write_frame(writer, &body, MAX).await.expect("write frame");
 }
 
@@ -47,7 +47,7 @@ async fn recv_message<R: AsyncRead + Unpin>(reader: &mut R) -> ServerMessage {
         .await
         .expect("read frame")
         .expect("frame present");
-    serde_json::from_slice(&body).expect("decode server message")
+    sealant_protocol::decode_server(&body).expect("decode server message")
 }
 
 #[tokio::test]

@@ -30,7 +30,10 @@ pub mod wire {
 
 pub use bytes::Base64Bytes;
 pub use command::*;
-pub use convert::{WireError, decode_client, decode_server, encode_client, encode_server};
+pub use convert::{
+    WireError, decode_client, decode_event, decode_server, encode_client, encode_event,
+    encode_server,
+};
 pub use error::{ControlError, ControlErrorCode};
 pub use event::*;
 pub use frame::{DEFAULT_MAX_FRAME_BYTES, LENGTH_PREFIX_BYTES, MIN_MAX_FRAME_BYTES};

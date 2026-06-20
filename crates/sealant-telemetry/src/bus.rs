@@ -222,7 +222,7 @@ impl EventBus {
     fn replay_spool(&self, durable: &Durable) {
         let mut spool = durable.spool.lock().unwrap_or_else(|e| e.into_inner());
         let result = spool.replay(|record| {
-            if let Ok(env) = serde_json::from_slice::<EventEnvelope>(&record.payload) {
+            if let Ok(env) = sealant_protocol::decode_event(&record.payload) {
                 durable
                     .high_water
                     .fetch_max(env.sequence.get(), Ordering::Relaxed);
@@ -247,7 +247,7 @@ impl EventBus {
     fn deliver_durable(&self, durable: &Durable, env: EventEnvelope) {
         let seq = env.sequence.get();
         let ts = env.observed_at.get();
-        let bytes = serde_json::to_vec(&env).unwrap_or_default();
+        let bytes = sealant_protocol::encode_event(&env);
         {
             let mut spool = durable.spool.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(error) = spool.append(seq, ts, &bytes) {
@@ -495,7 +495,7 @@ mod tests {
         );
         {
             let mut spool = open_spool(dir.path().into());
-            let bytes = serde_json::to_vec(&envelope).expect("ser");
+            let bytes = sealant_protocol::encode_event(&envelope);
             spool
                 .append(envelope.sequence.get(), 0, &bytes)
                 .expect("append");

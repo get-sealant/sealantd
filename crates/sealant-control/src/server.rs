@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use sealant_protocol::{
     ClientMessage, ControlError, ControlResponse, RequestId, SCHEMA_VERSION, ServerMessage,
+    decode_client, encode_server,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
@@ -20,9 +21,6 @@ const OUTBOUND_CAPACITY: usize = 256;
 /// Errors that terminate a connection.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnError {
-    /// Failed to encode a server message.
-    #[error("encode error: {0}")]
-    Encode(serde_json::Error),
     /// A framing/transport error.
     #[error(transparent)]
     Frame(FrameError),
@@ -33,29 +31,19 @@ async fn write_message<W: AsyncWrite + Unpin>(
     message: &ServerMessage,
     max_frame_bytes: u32,
 ) -> Result<(), ConnError> {
-    let body = serde_json::to_vec(message).map_err(ConnError::Encode)?;
+    let body = encode_server(message);
     write_frame(writer, &body, max_frame_bytes)
         .await
         .map_err(ConnError::Frame)
 }
 
-/// Best-effort extraction of a `requestId` from an unparseable request body, so even malformed
-/// requests get a correlated error response.
-fn salvage_request_id(body: &[u8]) -> RequestId {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("requestId")
-                .and_then(serde_json::Value::as_str)
-                .map(RequestId::new)
-        })
-        .unwrap_or_else(|| RequestId::new("unknown"))
-}
-
 /// Turn a received frame body into either a request to dispatch or an immediate error response.
 /// The error response is boxed because it is far larger than the request handle.
+///
+/// A malformed Protobuf frame cannot yield a correlated `requestId` (unlike the old salvageable
+/// JSON), so it is answered with an `unknown` request id.
 fn decode_request(body: &[u8]) -> Result<sealant_protocol::ControlRequest, Box<ControlResponse>> {
-    match serde_json::from_slice::<ClientMessage>(body) {
+    match decode_client(body) {
         Ok(ClientMessage::Request(request)) => {
             if request.schema_version != SCHEMA_VERSION {
                 return Err(Box::new(ControlResponse::error(
@@ -72,7 +60,7 @@ fn decode_request(body: &[u8]) -> Result<sealant_protocol::ControlRequest, Box<C
             Ok(request)
         }
         Err(e) => Err(Box::new(ControlResponse::error(
-            salvage_request_id(body),
+            RequestId::new("unknown"),
             ControlError::invalid_json(e.to_string()),
         ))),
     }
@@ -321,8 +309,7 @@ mod tests {
 
         // Send a runtime.health request.
         let request = ControlRequest::new(RequestId::new("req_1"), Command::RuntimeHealth);
-        let msg = ClientMessage::Request(request);
-        let body = serde_json::to_vec(&msg).expect("ser");
+        let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
         write_frame(&mut client, &body, 64 * 1024)
             .await
             .expect("write");
@@ -332,7 +319,7 @@ mod tests {
             .await
             .expect("read")
             .expect("some");
-        let resp: ServerMessage = serde_json::from_slice(&resp_body).expect("de");
+        let resp = sealant_protocol::decode_server(&resp_body).expect("de");
         match resp {
             ServerMessage::Response(r) => {
                 assert_eq!(r.request_id, RequestId::new("req_1"));
@@ -347,7 +334,7 @@ mod tests {
             .await
             .expect("read")
             .expect("some");
-        let evt: ServerMessage = serde_json::from_slice(&evt_body).expect("de");
+        let evt = sealant_protocol::decode_server(&evt_body).expect("de");
         match evt {
             ServerMessage::Event(e) => assert_eq!(e.sequence, Sequence(7)),
             ServerMessage::Response(_) => panic!("expected event"),
@@ -358,7 +345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_json_gets_correlated_error() {
+    async fn malformed_frame_gets_error_response() {
         let (events_tx, _) = broadcast::channel(16);
         let service = Arc::new(MockService { events: events_tx });
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -366,18 +353,19 @@ mod tests {
         let (server_read, server_write) = tokio::io::split(server);
         let conn = tokio::spawn(handle_connection(service, server_read, server_write, sd_rx));
 
-        // Not valid ClientMessage JSON, but carries a requestId we should salvage.
-        let body = br#"{"kind":"request","requestId":"req_bad","garbage":true}"#;
+        // Not a valid protobuf ClientMessage. Protobuf cannot salvage a requestId, so the daemon
+        // answers with an `unknown` request id and a decode error.
+        let body = b"this is not a valid protobuf frame \xff\x00\xfe";
         write_frame(&mut client, body, 4096).await.expect("write");
 
         let resp_body = read_frame(&mut client, 4096)
             .await
             .expect("read")
             .expect("some");
-        let resp: ServerMessage = serde_json::from_slice(&resp_body).expect("de");
+        let resp = sealant_protocol::decode_server(&resp_body).expect("de");
         match resp {
             ServerMessage::Response(r) => {
-                assert_eq!(r.request_id, RequestId::new("req_bad"));
+                assert_eq!(r.request_id, RequestId::new("unknown"));
                 assert!(!r.is_ok());
             }
             ServerMessage::Event(_) => panic!("expected error response"),

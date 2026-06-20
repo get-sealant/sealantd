@@ -107,7 +107,7 @@ async fn main() -> ExitCode {
     };
 
     let request = ControlRequest::new(RequestId::new("ctl_1"), command);
-    let body = serde_json::to_vec(&ClientMessage::Request(request)).unwrap_or_default();
+    let body = sealant_protocol::encode_client(&ClientMessage::Request(request));
     if let Err(error) = write_frame(&mut writer, &body, DEFAULT_MAX_FRAME_BYTES).await {
         eprintln!("sealantctl: write failed: {error}");
         return ExitCode::FAILURE;
@@ -116,7 +116,7 @@ async fn main() -> ExitCode {
     let mut exit = ExitCode::SUCCESS;
     loop {
         match read_frame(&mut reader, DEFAULT_MAX_FRAME_BYTES).await {
-            Ok(Some(frame)) => match serde_json::from_slice::<ServerMessage>(&frame) {
+            Ok(Some(frame)) => match sealant_protocol::decode_server(&frame) {
                 Ok(ServerMessage::Response(response)) => {
                     println!("{}", serde_json::to_string(&response).unwrap_or_default());
                     if !response.is_ok() {

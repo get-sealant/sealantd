@@ -1134,6 +1134,20 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
     wire::ServerMessage::decode(bytes)?.try_into()
 }
 
+/// Encode a single telemetry event to protobuf bytes (used by the durable spool).
+#[must_use]
+pub fn encode_event(event: &EventEnvelope) -> Vec<u8> {
+    wire::EventEnvelope::from(event.clone()).encode_to_vec()
+}
+
+/// Decode a single telemetry event from protobuf bytes.
+///
+/// # Errors
+/// Returns [`WireError`] on a malformed record.
+pub fn decode_event(bytes: &[u8]) -> Result<EventEnvelope, WireError> {
+    wire::EventEnvelope::decode(bytes)?.try_into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
