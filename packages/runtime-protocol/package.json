@@ -9,5 +9,8 @@
   "scripts": {
     "lint": "oxlint .",
     "typecheck": "tsgo -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "protobufjs": "^7"
   }
 }

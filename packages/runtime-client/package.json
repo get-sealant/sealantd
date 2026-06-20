@@ -12,6 +12,7 @@
     "typecheck": "tsgo -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@sealant/runtime-protocol": "workspace:*"
+    "@sealant/runtime-protocol": "workspace:*",
+    "protobufjs": "^8.6.4"
   }
 }

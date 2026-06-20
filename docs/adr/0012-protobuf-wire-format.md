@@ -2,12 +2,13 @@
 
 ## Status
 
-Accepted, 2026-06-20. Supersedes the *encoding* decision of
+Accepted and **implemented**, 2026-06-20. Supersedes the *encoding* decision of
 [ADR-0002](0002-wire-schema-and-framing.md). The length-prefixed framing and the
-single-schema-source principle from ADR-0002 are retained. **Not yet implemented**
-— scheduled as a dedicated protocol-format migration phase before any external,
-non-TypeScript SDK ships (see Migration below). The daemon continues on framed JSON
-until then.
+single-schema-source principle from ADR-0002 are retained. The daemon (Rust) and the
+TypeScript SDK now both speak Protobuf on the wire; the Rust domain types + serde and
+`sealantctl`'s JSON output remain the debug-JSON view. Follow-ups (not blocking):
+generate the TS SDK via Buf instead of runtime `protobufjs`, and wrap it in Effect
+Schema (ADR-0010).
 
 ## Context
 

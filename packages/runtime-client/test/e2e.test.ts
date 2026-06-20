@@ -1,5 +1,6 @@
-// Phase 1 acceptance: the TypeScript client starts the daemon, executes a command, streams events,
-// receives the correct result, and shuts it down — including binary-safe (NUL / non-UTF-8) output.
+// Phase 1 acceptance over the Protobuf wire (ADR-0012): the TypeScript client starts the daemon,
+// executes a command, streams events, receives the correct result, and shuts it down — including
+// binary-safe (NUL / non-UTF-8) output, which rides native protobuf `bytes` (no base64).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -10,10 +11,15 @@ import { rmSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 
 import { SealantClient } from "../src/client.ts";
-import { chunkBytes, isIoChunk, isProcessExited } from "../../runtime-protocol/src/index.ts";
+import {
+  chunkBytes,
+  isIoChunk,
+  isProcessExited,
+  STREAM_STDOUT,
+} from "../../runtime-protocol/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(here, "../../.."); // packages/runtime-client/test -> repo root
+const repoRoot = resolve(here, "../../..");
 const binPath = join(repoRoot, "target", "debug", "sealantd");
 
 let socketCounter = 0;
@@ -39,7 +45,7 @@ function waitExit(child: ChildProcess, ms = 5000): Promise<void> {
   });
 }
 
-test("starts daemon, execs a command, streams events, gets the result, and shuts down", async () => {
+test("starts daemon, execs, streams events, gets the result, and shuts down", async () => {
   const socketPath = uniqueSocket();
   const { client, child } = await SealantClient.spawn({
     binPath,
@@ -50,11 +56,11 @@ test("starts daemon, execs a command, streams events, gets the result, and shuts
   });
   try {
     const health = await client.health();
-    assert.equal(health.state, "healthy");
+    assert.equal(health.state, "RUNTIME_STATE_HEALTHY");
 
     const caps = await client.getCapabilities();
     assert.equal(caps.features.ioCapture, true);
-    assert.equal(caps.features.pty, false);
+    assert.equal(caps.features.pty, true);
 
     const events = client.events();
     const accepted = await client.exec({ executable: "/bin/echo", args: ["hello"] });
@@ -64,11 +70,11 @@ test("starts daemon, execs a command, streams events, gets the result, and shuts
     let stdout = Buffer.alloc(0);
     let exitCode: number | undefined;
     for await (const event of events) {
-      if (isIoChunk(event) && event.stream === "stdout") {
+      if (isIoChunk(event) && event.ioChunk.stream === STREAM_STDOUT) {
         stdout = Buffer.concat([stdout, chunkBytes(event)]);
       }
       if (isProcessExited(event)) {
-        exitCode = event.exitCode;
+        exitCode = event.processExited.exitCode;
         break;
       }
     }
@@ -83,7 +89,7 @@ test("starts daemon, execs a command, streams events, gets the result, and shuts
   }
 });
 
-test("captures binary-unsafe output exactly (NUL and high bytes round-trip)", async () => {
+test("captures binary-unsafe output exactly (NUL and high bytes, native protobuf bytes)", async () => {
   const socketPath = uniqueSocket();
   const { client, child } = await SealantClient.spawn({ binPath, socketPath, workspace: tmpdir() });
   try {
@@ -93,7 +99,7 @@ test("captures binary-unsafe output exactly (NUL and high bytes round-trip)", as
     let stdout = Buffer.alloc(0);
     let exited = false;
     for await (const event of events) {
-      if (isIoChunk(event) && event.stream === "stdout") {
+      if (isIoChunk(event) && event.ioChunk.stream === STREAM_STDOUT) {
         stdout = Buffer.concat([stdout, chunkBytes(event)]);
       }
       if (isProcessExited(event)) {
@@ -120,7 +126,7 @@ test("returns a typed control error for an unknown executable", async () => {
       () => client.exec({ executable: "/no/such/binary-xyz", args: [] }),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.equal((error as { code?: string }).code, "process-start-failed");
+        assert.equal((error as { code?: string }).code, "CONTROL_ERROR_CODE_PROCESS_START_FAILED");
         return true;
       },
     );
