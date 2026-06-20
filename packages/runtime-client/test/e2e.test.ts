@@ -1,6 +1,6 @@
-// Phase 1 acceptance over the Protobuf wire (ADR-0012): the TypeScript client starts the daemon,
-// executes a command, streams events, receives the correct result, and shuts it down — including
-// binary-safe (NUL / non-UTF-8) output, which rides native protobuf `bytes` (no base64).
+// Acceptance over the Protobuf wire (ADR-0012) with the Buf-generated typed SDK: the client starts
+// the daemon, execs, streams typed events (discriminated `payload.case`), gets the typed result, and
+// shuts down — including binary-safe (NUL / non-UTF-8) output that rides native protobuf `bytes`.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -8,14 +8,14 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { rmSync } from "node:fs";
+import { Buffer } from "node:buffer";
 import type { ChildProcess } from "node:child_process";
 
-import { SealantClient } from "../src/client.ts";
+import { SealantClient, SealantError } from "../src/client.ts";
 import {
-  chunkBytes,
-  isIoChunk,
-  isProcessExited,
-  STREAM_STDOUT,
+  ControlErrorCode,
+  RuntimeState,
+  StreamKind,
 } from "../../runtime-protocol/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -45,7 +45,7 @@ function waitExit(child: ChildProcess, ms = 5000): Promise<void> {
   });
 }
 
-test("starts daemon, execs, streams events, gets the result, and shuts down", async () => {
+test("starts daemon, execs, streams typed events, gets the result, and shuts down", async () => {
   const socketPath = uniqueSocket();
   const { client, child } = await SealantClient.spawn({
     binPath,
@@ -56,11 +56,11 @@ test("starts daemon, execs, streams events, gets the result, and shuts down", as
   });
   try {
     const health = await client.health();
-    assert.equal(health.state, "RUNTIME_STATE_HEALTHY");
+    assert.equal(health.state, RuntimeState.HEALTHY);
 
     const caps = await client.getCapabilities();
-    assert.equal(caps.features.ioCapture, true);
-    assert.equal(caps.features.pty, true);
+    assert.equal(caps.features?.ioCapture, true);
+    assert.equal(caps.features?.pty, true);
 
     const events = client.events();
     const accepted = await client.exec({ executable: "/bin/echo", args: ["hello"] });
@@ -70,11 +70,12 @@ test("starts daemon, execs, streams events, gets the result, and shuts down", as
     let stdout = Buffer.alloc(0);
     let exitCode: number | undefined;
     for await (const event of events) {
-      if (isIoChunk(event) && event.ioChunk.stream === STREAM_STDOUT) {
-        stdout = Buffer.concat([stdout, chunkBytes(event)]);
+      if (event.payload.case === "ioChunk" && event.payload.value.stream === StreamKind.STDOUT) {
+        const content = event.payload.value.content;
+        if (content) stdout = Buffer.concat([stdout, Buffer.from(content)]);
       }
-      if (isProcessExited(event)) {
-        exitCode = event.processExited.exitCode;
+      if (event.payload.case === "processExited") {
+        exitCode = event.payload.value.exitCode;
         break;
       }
     }
@@ -99,10 +100,11 @@ test("captures binary-unsafe output exactly (NUL and high bytes, native protobuf
     let stdout = Buffer.alloc(0);
     let exited = false;
     for await (const event of events) {
-      if (isIoChunk(event) && event.ioChunk.stream === STREAM_STDOUT) {
-        stdout = Buffer.concat([stdout, chunkBytes(event)]);
+      if (event.payload.case === "ioChunk" && event.payload.value.stream === StreamKind.STDOUT) {
+        const content = event.payload.value.content;
+        if (content) stdout = Buffer.concat([stdout, Buffer.from(content)]);
       }
-      if (isProcessExited(event)) {
+      if (event.payload.case === "processExited") {
         exited = true;
         break;
       }
@@ -125,8 +127,8 @@ test("returns a typed control error for an unknown executable", async () => {
     await assert.rejects(
       () => client.exec({ executable: "/no/such/binary-xyz", args: [] }),
       (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.equal((error as { code?: string }).code, "CONTROL_ERROR_CODE_PROCESS_START_FAILED");
+        assert.ok(error instanceof SealantError);
+        assert.equal(error.code, ControlErrorCode.PROCESS_START_FAILED);
         return true;
       },
     );

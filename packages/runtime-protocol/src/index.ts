@@ -1,74 +1,57 @@
 // @sealant/runtime-protocol
 //
-// TypeScript view of the sealantd control protocol over the Protobuf wire (ADR-0012). The schema is
-// loaded at runtime from the Rust crate's sealant.proto (the single source of truth; vendored into
-// this package at monorepo integration). Length-prefixed framing is unchanged.
+// Typed wire codec + length-prefixed framing for the sealantd control protocol (ADR-0012). Types are
+// generated from `sealant.proto` by Buf (protobuf-es); the schema is baked into the generated code,
+// so there is no runtime `.proto` load and the package is self-contained.
 //
-// Message objects use protobuf.js's shape: camelCase fields, oneofs as a discriminator field plus
-// the active case's data (e.g. a ServerMessage event sets `event`; an io.chunk event sets `ioChunk`
-// and `payload === "ioChunk"`). Binary fields decode to Buffer (no base64).
+// Messages are protobuf-es objects: camelCase fields, oneofs as discriminated unions
+// (`message.case === "event"`, `payload.case === "ioChunk"`), enums as TS enums (`StreamKind.STDOUT`),
+// and `bytes` fields as `Uint8Array` (no base64).
 
-import protobuf from "protobufjs";
+import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Buffer } from "node:buffer";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const PROTO_PATH = resolve(here, "../../../crates/sealant-protocol/proto/sealant.proto");
+import {
+  ClientMessageSchema,
+  ServerMessageSchema,
+  EventEnvelopeSchema,
+  type ClientMessage,
+  type ServerMessage,
+  type EventEnvelope,
+} from "./gen/sealant_pb.ts";
 
-const root = protobuf.loadSync(PROTO_PATH);
-const ClientMessageT = root.lookupType("sealant.v1.ClientMessage");
-const ServerMessageT = root.lookupType("sealant.v1.ServerMessage");
+// Re-export the full generated surface (types, enums, schemas) plus protobuf-es `create`.
+export * from "./gen/sealant_pb.ts";
+export { create } from "@bufbuild/protobuf";
 
 /** Current wire schema version. */
 export const SCHEMA_VERSION = 1;
 /** Default maximum control-frame body size (8 MiB). */
 export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
-/** A protobuf command oneof, e.g. `{ runtimeHealth: {} }` or `{ exec: { executable, args } }`. */
-export type Command = Record<string, unknown>;
-
-/** A control request payload (the `request` case of ClientMessage). */
-export interface ControlRequest {
-  schemaVersion: number;
-  requestId: string;
-  command: Command;
-}
-
-/** A decoded server message: `{ message, response?|event? }` (protobuf.js oneof shape). */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type ServerMessage = Record<string, any>;
-
-/** Encode a client request to protobuf bytes. */
-export function encodeClient(request: ControlRequest): Buffer {
-  const payload = { request };
-  const err = ClientMessageT.verify(payload);
-  if (err) {
-    throw new Error(`invalid client message: ${err}`);
-  }
-  return Buffer.from(ClientMessageT.encode(ClientMessageT.create(payload)).finish());
+/** Encode a client message to protobuf bytes. */
+export function encodeClient(message: ClientMessage): Uint8Array {
+  return toBinary(ClientMessageSchema, message);
 }
 
 /** Decode a server message from protobuf bytes. */
-export function decodeServer(bytes: Buffer): ServerMessage {
-  const message = ServerMessageT.decode(bytes);
-  return ServerMessageT.toObject(message, {
-    enums: String,
-    longs: Number,
-    bytes: Buffer,
-    defaults: false,
-    oneofs: true,
-  });
+export function decodeServer(bytes: Uint8Array): ServerMessage {
+  return fromBinary(ServerMessageSchema, bytes);
+}
+
+/** Decode a single telemetry event from protobuf bytes (e.g. a spooled record). */
+export function decodeEvent(bytes: Uint8Array): EventEnvelope {
+  return fromBinary(EventEnvelopeSchema, bytes);
 }
 
 /** Frame a protobuf body with a big-endian u32 length prefix. */
-export function encodeFrame(body: Buffer): Buffer {
+export function encodeFrame(body: Uint8Array): Buffer {
   const header = Buffer.allocUnsafe(4);
   header.writeUInt32BE(body.length, 0);
-  return Buffer.concat([header, body]);
+  return Buffer.concat([header, Buffer.from(body)]);
 }
 
-/** Incremental frame decoder: feed socket chunks, get decoded ServerMessages back. */
+/** Incremental frame decoder: feed socket chunks, get decoded `ServerMessage`s back. */
 export class FrameDecoder {
   #buffer: Buffer = Buffer.alloc(0);
   #maxFrameBytes: number;
@@ -95,36 +78,12 @@ export class FrameDecoder {
   }
 }
 
-// --- helpers over the protobuf.js shape ---
-
-/** Whether a server message is a telemetry event. */
-export function isEvent(message: ServerMessage): boolean {
-  return message.event !== undefined;
+/** Narrow a server message to its response (or `undefined`). */
+export function asResponse(message: ServerMessage) {
+  return message.message.case === "response" ? message.message.value : undefined;
 }
 
-/** Whether a server message is a response. */
-export function isResponse(message: ServerMessage): boolean {
-  return message.response !== undefined;
+/** Narrow a server message to its telemetry event (or `undefined`). */
+export function asEvent(message: ServerMessage): EventEnvelope | undefined {
+  return message.message.case === "event" ? message.message.value : undefined;
 }
-
-/** Whether an event is an `io.chunk`. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function isIoChunk(event: any): boolean {
-  return event?.ioChunk !== undefined;
-}
-
-/** Whether an event is a `process.exited`. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function isProcessExited(event: any): boolean {
-  return event?.processExited !== undefined;
-}
-
-/** Raw bytes of an `io.chunk` event (empty if none). */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function chunkBytes(event: any): Buffer {
-  const content = event?.ioChunk?.content;
-  return content ? Buffer.from(content) : Buffer.alloc(0);
-}
-
-/** Proto enum string for stdout. */
-export const STREAM_STDOUT = "STREAM_KIND_STDOUT";

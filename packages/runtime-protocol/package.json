@@ -7,10 +7,11 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "generate": "buf generate",
     "lint": "oxlint .",
     "typecheck": "tsgo -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "protobufjs": "^7"
+    "@bufbuild/protobuf": "^2.12.0"
   }
 }
