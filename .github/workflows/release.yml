@@ -48,9 +48,13 @@ jobs:
 
   npm:
     runs-on: ubuntu-latest
+    # Gate every publish behind a protected environment: add required reviewers + restrict deployment
+    # to protected tags in repo Settings -> Environments -> npm-publish. This means a compromised PR,
+    # dependency, or fork cannot trigger a publish without human approval.
+    environment: npm-publish
     permissions:
       contents: read
-      id-token: write # npm provenance via OIDC
+      id-token: write # OIDC: lets npm Trusted Publishing authenticate with no stored token
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -58,13 +62,20 @@ jobs:
         with:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
-      - run: pnpm install --frozen-lockfile
+      # --ignore-scripts: never run dependency lifecycle scripts in the publish job. The build below
+      # needs none (codegen is committed; build is just tsc).
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       # Sync the SDK package versions to the git tag (tag is the single source of truth).
       - run: |
           VERSION="${GITHUB_REF_NAME#v}"
           pnpm --filter "@sealant/runtime-protocol" --filter "@sealant/runtime-client" \
             exec npm version "$VERSION" --no-git-tag-version --allow-same-version
       - run: pnpm -r build
-      - run: pnpm -r publish --access public --no-git-checks --provenance
+      # Token-based publish (interim). Once Trusted Publishing is configured on npmjs.com for BOTH
+      # packages, delete `env: NODE_AUTH_TOKEN` below and the NPM_TOKEN secret — the OIDC id-token
+      # above authenticates the publish with no stored credential.
+      # `--provenance` is intentionally omitted: npm provenance requires a PUBLIC source repo, so add
+      # it back only once these repos are public.
+      - run: pnpm -r publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

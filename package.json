@@ -10,8 +10,7 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "@bufbuild/buf",
-      "protobufjs"
+      "@bufbuild/buf"
     ]
   },
   "scripts": {
