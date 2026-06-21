@@ -42,7 +42,7 @@ sha2 = "0.10"
 getrandom = "0.2"
 tempfile = "3"
 # filesystem telemetry (plan §13)
-notify = "6"
+notify = "8"
 walkdir = "2"
 # linux syscalls (prefer rustix/nix over raw libc)
 nix = { version = "0.31", features = ["process", "signal", "term", "fs", "user", "poll", "ioctl", "socket"] }
