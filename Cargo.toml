@@ -50,7 +50,7 @@ rustix = { version = "0.38", features = ["process", "fs", "termios", "pipe", "st
 libc = "0.2"
 # protobuf wire format (ADR-0012)
 prost = "0.14"
-prost-build = "0.13"
+prost-build = "0.14"
 protoc-bin-vendored = "3"
 # cli
 clap = { version = "4", features = ["derive"] }
