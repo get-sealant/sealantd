@@ -6,9 +6,11 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod boot;
 pub mod runtime;
 pub mod shutdown;
 
 pub use app::run;
+pub use boot::{BootConfig, run_boot};
 pub use runtime::Runtime;
 pub use shutdown::ShutdownSignal;

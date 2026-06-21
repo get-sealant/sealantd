@@ -877,7 +877,9 @@ dependencies = [
 name = "sealantd"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "clap",
+ "nix",
  "sealant-control",
  "sealant-eventlog",
  "sealant-fs",
@@ -887,7 +889,10 @@ dependencies = [
  "sealant-pty",
  "sealant-runtime-core",
  "sealant-telemetry",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
