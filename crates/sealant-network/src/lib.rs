@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod forward;
 pub mod proxy;
 pub mod runtime;
 
+pub use forward::ForwardRuntime;
 pub use runtime::{NetworkConfig, NetworkRuntime};

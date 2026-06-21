@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sealant_protocol::{EventId, ProcessId, RequestId, RuntimeId, SessionId};
+use sealant_protocol::{ChannelId, EventId, ProcessId, RequestId, RuntimeId, SessionId};
 
 /// Mint a fresh, random runtime id (`rt_<16 hex>`).
 #[must_use]
@@ -81,6 +81,12 @@ impl IdGenerator {
     #[must_use]
     pub fn request_id(&self) -> RequestId {
         RequestId::new(self.mint(RequestId::PREFIX))
+    }
+
+    /// Mint a fresh channel id (PTY attach / TCP forward / SFTP conduit).
+    #[must_use]
+    pub fn channel_id(&self) -> ChannelId {
+        ChannelId::new(self.mint(ChannelId::PREFIX))
     }
 }
 

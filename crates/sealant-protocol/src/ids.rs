@@ -106,6 +106,11 @@ string_id!(
     EventId,
     "evt"
 );
+string_id!(
+    /// A bidirectional byte conduit (PTY attach / TCP forward / SFTP) over one control connection.
+    ChannelId,
+    "chan"
+);
 
 /// Monotonic order within a defined sequence domain (one domain per runtime).
 ///

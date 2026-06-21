@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use sealant_protocol::{
     ClientMessage, ControlError, ControlResponse, RequestId, SCHEMA_VERSION, ServerMessage,
-    decode_client, encode_server,
+    StreamFrame, decode_client, encode_server,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::frame::{FrameError, read_frame, write_frame};
-use crate::service::ControlService;
+use crate::service::{ChannelRegistry, ConnHandle, ControlService};
 
 /// Per-connection outbound queue capacity (responses + forwarded events).
 const OUTBOUND_CAPACITY: usize = 256;
@@ -37,16 +37,22 @@ async fn write_message<W: AsyncWrite + Unpin>(
         .map_err(ConnError::Frame)
 }
 
-/// Turn a received frame body into either a request to dispatch or an immediate error response.
-/// The error response is boxed because it is far larger than the request handle.
+/// A decoded inbound frame: a request to dispatch, an inbound stream frame to route, or an immediate
+/// error response (boxed, as it is far larger than the other arms).
 ///
 /// A malformed Protobuf frame cannot yield a correlated `requestId` (unlike the old salvageable
 /// JSON), so it is answered with an `unknown` request id.
-fn decode_request(body: &[u8]) -> Result<sealant_protocol::ControlRequest, Box<ControlResponse>> {
+enum Inbound {
+    Request(sealant_protocol::ControlRequest),
+    Stream(StreamFrame),
+    Error(Box<ControlResponse>),
+}
+
+fn decode_inbound(body: &[u8]) -> Inbound {
     match decode_client(body) {
         Ok(ClientMessage::Request(request)) => {
             if request.schema_version != SCHEMA_VERSION {
-                return Err(Box::new(ControlResponse::error(
+                return Inbound::Error(Box::new(ControlResponse::error(
                     request.request_id,
                     ControlError::new(
                         sealant_protocol::ControlErrorCode::UnsupportedVersion,
@@ -57,12 +63,29 @@ fn decode_request(body: &[u8]) -> Result<sealant_protocol::ControlRequest, Box<C
                     ),
                 )));
             }
-            Ok(request)
+            Inbound::Request(request)
         }
-        Err(e) => Err(Box::new(ControlResponse::error(
+        Ok(ClientMessage::Stream(frame)) => Inbound::Stream(frame),
+        Err(e) => Inbound::Error(Box::new(ControlResponse::error(
             RequestId::new("unknown"),
             ControlError::invalid_json(e.to_string()),
         ))),
+    }
+}
+
+/// Route one inbound stream frame from the gateway to the registered far-end sink. `Data`/
+/// `WindowUpdate` are forwarded; an `End` forwards then deregisters (half-close). Unknown channels
+/// are dropped silently (the channel may have already torn down).
+async fn route_inbound_stream(channels: &ChannelRegistry, frame: StreamFrame) {
+    use sealant_protocol::StreamPayload;
+    let is_end = matches!(frame.payload, StreamPayload::End(_));
+    let sink = channels.lock().await.get(&frame.channel_id).cloned();
+    if let Some(sink) = sink {
+        // Awaiting send applies inbound backpressure toward the gateway via the bounded queue.
+        let _ = sink.send(frame.payload).await;
+    }
+    if is_end {
+        channels.lock().await.remove(&frame.channel_id);
     }
 }
 
@@ -81,6 +104,17 @@ pub async fn handle_connection<S, R, W>(
 {
     let max_frame_bytes = service.max_frame_bytes();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMessage>(OUTBOUND_CAPACITY);
+
+    // Per-connection channel registry: ChannelId -> inbound sink (gateway → far end). Owned here and
+    // shared into the ConnHandle so streaming commands register their sink and so dropping it on
+    // teardown closes every pump task. Channels are connection-scoped: when this connection drops,
+    // all its PTY attaches / forwards / sftp bridges die.
+    let channels: ChannelRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let conn = ConnHandle {
+        out_tx: out_tx.clone(),
+        channels: channels.clone(),
+        shutdown: shutdown.clone(),
+    };
 
     // Writer task: the single owner of the write half; drains responses and forwarded events.
     let writer_task = tokio::spawn(async move {
@@ -124,12 +158,23 @@ pub async fn handle_connection<S, R, W>(
             frame = read_frame(&mut reader, max_frame_bytes) => {
                 match frame {
                     Ok(Some(body)) => {
-                        let response = match decode_request(&body) {
-                            Ok(request) => service.handle(request).await,
-                            Err(error_response) => *error_response,
-                        };
-                        if out_tx.send(ServerMessage::Response(response)).await.is_err() {
-                            break;
+                        match decode_inbound(&body) {
+                            Inbound::Request(request) => {
+                                let response = service.handle_on_connection(request, &conn).await;
+                                if out_tx.send(ServerMessage::Response(response)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            // Inbound bytes/credits/close from the gateway: route to the far end.
+                            // This never produces a response frame.
+                            Inbound::Stream(frame) => {
+                                route_inbound_stream(&channels, frame).await;
+                            }
+                            Inbound::Error(error_response) => {
+                                if out_tx.send(ServerMessage::Response(*error_response)).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -153,8 +198,12 @@ pub async fn handle_connection<S, R, W>(
         }
     }
 
-    // Tear down: dropping out_tx + aborting the forwarder closes the outbound queue so the writer
-    // drains and exits.
+    // Tear down: clearing the channel registry drops every inbound sink so the per-channel pump
+    // tasks observe closed senders and exit (connection-scoped channel lifetime); dropping out_tx +
+    // aborting the forwarder closes the outbound queue so the writer drains and exits. We also drop
+    // the ConnHandle (which holds clones of both) before joining the writer.
+    channels.lock().await.clear();
+    drop(conn);
     drop(out_tx);
     forwarder.abort();
     let _ = writer_task.await;
@@ -254,9 +303,9 @@ pub async fn serve_stdio<S: ControlService>(service: Arc<S>, shutdown: watch::Re
 mod tests {
     use super::*;
     use sealant_protocol::{
-        CaptureMethod, Command, CommandResult, Confidence, ControlRequest, EventEnvelope, EventId,
-        EventPayload, MonotonicNanos, RuntimeHeartbeat, RuntimeId, RuntimeState, Sequence,
-        WallClockMicros,
+        CaptureMethod, ChannelId, Command, CommandResult, Confidence, ControlRequest,
+        EventEnvelope, EventId, EventPayload, MonotonicNanos, RuntimeHeartbeat, RuntimeId,
+        RuntimeState, Sequence, StreamFrame, StreamPayload, WallClockMicros, encode_client,
     };
 
     struct MockService {
@@ -264,7 +313,11 @@ mod tests {
     }
 
     impl ControlService for MockService {
-        async fn handle(&self, request: ControlRequest) -> ControlResponse {
+        async fn handle_on_connection(
+            &self,
+            request: ControlRequest,
+            _conn: &ConnHandle,
+        ) -> ControlResponse {
             match request.command {
                 Command::RuntimeHealth => {
                     ControlResponse::ok_with(request.request_id, CommandResult::Accepted)
@@ -334,7 +387,7 @@ mod tests {
                 assert_eq!(r.request_id, RequestId::new("req_1"));
                 assert!(r.is_ok());
             }
-            ServerMessage::Event(_) => panic!("expected response first"),
+            other => panic!("expected response first, got {other:?}"),
         }
 
         // Publish a telemetry event; it should arrive on the connection.
@@ -346,7 +399,7 @@ mod tests {
         let evt = sealant_protocol::decode_server(&evt_body).expect("de");
         match evt {
             ServerMessage::Event(e) => assert_eq!(e.sequence, Sequence(7)),
-            ServerMessage::Response(_) => panic!("expected event"),
+            other => panic!("expected event, got {other:?}"),
         }
 
         drop(client);
@@ -377,9 +430,138 @@ mod tests {
                 assert_eq!(r.request_id, RequestId::new("unknown"));
                 assert!(!r.is_ok());
             }
-            ServerMessage::Event(_) => panic!("expected error response"),
+            other => panic!("expected error response, got {other:?}"),
         }
         drop(client);
         let _ = conn.await;
+    }
+
+    /// A service whose `RuntimeHealth` opens a channel ("chan_echo") on the connection: it registers
+    /// an inbound sink and spawns a pump that echoes every inbound `Data` frame back out as an
+    /// outbound `StreamFrame::Data`. Proves the ConnHandle/registry wiring end-to-end.
+    struct EchoChannelService {
+        events: broadcast::Sender<EventEnvelope>,
+    }
+
+    impl ControlService for EchoChannelService {
+        async fn handle_on_connection(
+            &self,
+            request: ControlRequest,
+            conn: &ConnHandle,
+        ) -> ControlResponse {
+            let channel = ChannelId::new("chan_echo");
+            let (in_tx, mut in_rx) = mpsc::channel::<StreamPayload>(8);
+            conn.register_channel(channel.clone(), in_tx).await;
+            let out_tx = conn.out_tx.clone();
+            tokio::spawn(async move {
+                let mut seq = 0u64;
+                while let Some(payload) = in_rx.recv().await {
+                    match payload {
+                        StreamPayload::Data { data } => {
+                            let frame = StreamFrame::data(channel.clone(), seq, data);
+                            seq += 1;
+                            if out_tx.send(ServerMessage::Stream(frame)).await.is_err() {
+                                break;
+                            }
+                        }
+                        StreamPayload::End(_) => break,
+                        StreamPayload::WindowUpdate { .. } => {}
+                    }
+                }
+            });
+            ControlResponse::ok_with(request.request_id, CommandResult::Accepted)
+        }
+        fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
+            self.events.subscribe()
+        }
+        fn max_frame_bytes(&self) -> u32 {
+            64 * 1024
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_stream_frames_route_to_registered_channel() {
+        let (events_tx, _) = broadcast::channel(16);
+        let service = Arc::new(EchoChannelService { events: events_tx });
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let conn = tokio::spawn(handle_connection(service, server_read, server_write, sd_rx));
+
+        // Open the echo channel via a request.
+        let req = ControlRequest::new(RequestId::new("req_open"), Command::RuntimeHealth);
+        let body = encode_client(&ClientMessage::Request(req));
+        write_frame(&mut client, &body, 64 * 1024)
+            .await
+            .expect("write");
+        // Drain the response.
+        let resp = read_frame(&mut client, 64 * 1024)
+            .await
+            .expect("r")
+            .expect("s");
+        assert!(matches!(
+            sealant_protocol::decode_server(&resp).expect("de"),
+            ServerMessage::Response(_)
+        ));
+
+        // Send three inbound Data frames; they must echo back in order.
+        for i in 0..3u8 {
+            let frame = StreamFrame::data(ChannelId::new("chan_echo"), u64::from(i), vec![i; 4]);
+            let body = encode_client(&ClientMessage::Stream(frame));
+            write_frame(&mut client, &body, 64 * 1024).await.expect("w");
+        }
+        for i in 0..3u8 {
+            let out = read_frame(&mut client, 64 * 1024)
+                .await
+                .expect("r")
+                .expect("s");
+            match sealant_protocol::decode_server(&out).expect("de") {
+                ServerMessage::Stream(StreamFrame {
+                    payload: StreamPayload::Data { data },
+                    seq,
+                    channel_id,
+                }) => {
+                    assert_eq!(channel_id, ChannelId::new("chan_echo"));
+                    assert_eq!(seq, u64::from(i));
+                    assert_eq!(data.as_slice(), &[i; 4]);
+                }
+                other => panic!("expected echoed data, got {other:?}"),
+            }
+        }
+
+        drop(client);
+        let _ = conn.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_tears_down_channels() {
+        // The echo pump holds the inbound receiver; when the connection drops, handle_connection
+        // clears the registry, dropping the inbound sender so the pump's recv() returns None and the
+        // task exits. We observe this by confirming handle_connection returns (joins) after the
+        // client disconnects, which only happens once the writer task drains — i.e. all clones of
+        // out_tx (including the pump's) are gone.
+        let (events_tx, _) = broadcast::channel(16);
+        let service = Arc::new(EchoChannelService { events: events_tx });
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let conn = tokio::spawn(handle_connection(service, server_read, server_write, sd_rx));
+
+        let req = ControlRequest::new(RequestId::new("req_open"), Command::RuntimeHealth);
+        let body = encode_client(&ClientMessage::Request(req));
+        write_frame(&mut client, &body, 64 * 1024)
+            .await
+            .expect("write");
+        let _ = read_frame(&mut client, 64 * 1024)
+            .await
+            .expect("r")
+            .expect("s");
+
+        // Disconnect. handle_connection must return promptly (channels torn down, writer drained).
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn)
+            .await
+            .expect("handle_connection should return after teardown")
+            .expect("join");
     }
 }

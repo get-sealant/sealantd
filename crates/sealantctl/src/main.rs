@@ -132,6 +132,11 @@ async fn main() -> ExitCode {
                         break;
                     }
                 }
+                Ok(ServerMessage::Stream(frame)) => {
+                    // The CLI is a request/response + telemetry tool; raw byte conduits are driven
+                    // by the gateway, not sealantctl. Surface a debug line and keep reading.
+                    println!("{}", serde_json::to_string(&frame).unwrap_or_default());
+                }
                 Err(error) => eprintln!("sealantctl: decode error: {error}"),
             },
             Ok(None) => break,

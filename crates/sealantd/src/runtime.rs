@@ -5,17 +5,18 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sealant_control::ControlService;
+use sealant_control::{ConnHandle, ControlService};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
 use sealant_fs::snapshot::SnapshotConfig;
 use sealant_fs::{FilesystemConfig, FilesystemRuntime};
-use sealant_network::{NetworkConfig, NetworkRuntime};
-use sealant_process::{ProcessRegistry, ProcessRuntime};
+use sealant_network::{ForwardRuntime, NetworkConfig, NetworkRuntime};
+use sealant_process::{ProcessRegistry, ProcessRuntime, SftpRuntime};
 use sealant_protocol::{
-    Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
-    ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
-    FeatureState, HealthReport, NetworkMode, ProcessList, ProcessState, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, ShutdownAccepted, Signal,
+    Capabilities, Command, CommandResult, Confidence, ControlError, ControlErrorCode,
+    ControlRequest, ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature,
+    FeatureMatrix, FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessList,
+    ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal, StreamAttached,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
@@ -106,7 +107,6 @@ fn build_bus(
 pub struct Runtime {
     config: Arc<RuntimeConfig>,
     clock: Arc<Clock>,
-    #[allow(dead_code)]
     idgen: Arc<IdGenerator>,
     status: Arc<RuntimeStatus>,
     bus: Arc<EventBus>,
@@ -114,6 +114,8 @@ pub struct Runtime {
     sessions: SessionRuntime,
     filesystem: Arc<FilesystemRuntime>,
     network: Arc<NetworkRuntime>,
+    forwards: Arc<ForwardRuntime>,
+    sftp: Arc<SftpRuntime>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
@@ -185,6 +187,8 @@ impl Runtime {
             sessions,
             filesystem,
             network,
+            forwards: Arc::new(ForwardRuntime::new()),
+            sftp: Arc::new(SftpRuntime::new()),
             extra_env,
             shutdown,
             features: Mutex::new(default_feature_states()),
@@ -197,6 +201,12 @@ impl Runtime {
     #[must_use]
     pub fn process_registry(&self) -> Arc<ProcessRegistry> {
         self.processes.registry.clone()
+    }
+
+    /// The interactive-session runtime (used by tests to drive PTY input/attachment directly).
+    #[must_use]
+    pub fn session_runtime(&self) -> &SessionRuntime {
+        &self.sessions
     }
 
     /// Spawn a managed process through the process runtime so its stdout/stderr flow onto the event
@@ -565,6 +575,18 @@ impl Runtime {
                 self.set_feature(feature, enabled);
                 ControlResponse::accepted(rid)
             }
+            // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
+            Command::AttachSession(_)
+            | Command::DetachSession { .. }
+            | Command::OpenForward(_)
+            | Command::CloseForward { .. }
+            | Command::OpenSftp(_)
+            | Command::CloseSftp { .. } => ControlResponse::error(
+                rid,
+                ControlError::unknown_command(
+                    "streaming command requires a connection-scoped writer".to_owned(),
+                ),
+            ),
         }
     }
 
@@ -575,11 +597,158 @@ impl Runtime {
             }
         }
     }
+
+    /// Whether the given feature kill switch is currently enabled.
+    fn feature_enabled(&self, feature: Feature) -> bool {
+        self.features
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&feature)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Dispatch the connection-scoped streaming commands (gateway consolidation §1.A/§1.B/§1.C).
+    ///
+    /// Each open binds a fresh [`ChannelId`] to a byte source and pumps it over `conn.out_tx` with
+    /// backpressure; inbound bytes arrive as `ClientMessage::Stream` and are routed by the control
+    /// server to the sink registered here. None of these touch the telemetry `EventBus`.
+    async fn dispatch_streaming(
+        &self,
+        request: ControlRequest,
+        conn: &ConnHandle,
+    ) -> ControlResponse {
+        let rid = request.request_id.clone();
+        if matches!(
+            self.status.state(),
+            RuntimeState::ShuttingDown | RuntimeState::Stopped
+        ) {
+            return ControlResponse::error(
+                rid,
+                ControlError::runtime_shutting_down("runtime is shutting down".to_owned()),
+            );
+        }
+
+        match request.command {
+            // §1.A — attach a session's PTY output to a fresh reliable channel.
+            Command::AttachSession(args) => {
+                let channel_id = self.idgen.channel_id();
+                match self.sessions.attach(
+                    &args.session_id,
+                    channel_id.clone(),
+                    conn.out_tx.clone(),
+                ) {
+                    Ok(()) => {
+                        // No inbound sink for attach: client keystrokes use writeStdin (the PTY is
+                        // the input path). Register an empty placeholder is unnecessary.
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::StreamAttached(StreamAttached { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::DetachSession { channel_id } => {
+                self.sessions.detach(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // §1.B — open a direct-tcpip forward to host:port.
+            Command::OpenForward(args) => {
+                if !self.feature_enabled(Feature::NetworkCollection) {
+                    return ControlResponse::error(
+                        rid,
+                        ControlError::new(
+                            ControlErrorCode::PolicyDenied,
+                            "tcp forwarding is disabled (networkCollection feature off)".to_owned(),
+                        ),
+                    );
+                }
+                let channel_id = self.idgen.channel_id();
+                match self
+                    .forwards
+                    .open(
+                        channel_id.clone(),
+                        &args.host,
+                        args.port,
+                        args.execution_id,
+                        conn.out_tx.clone(),
+                    )
+                    .await
+                {
+                    Ok(inbound) => {
+                        conn.register_channel(channel_id.clone(), inbound).await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::ForwardOpened(ForwardOpened { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::CloseForward { channel_id } => {
+                self.forwards.close(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // §1.C — open an SFTP bridge (in-container sftp-server stdio).
+            Command::OpenSftp(args) => {
+                let cwd = args
+                    .cwd
+                    .map_or_else(|| self.config.workspace_root.clone(), Into::into);
+                let channel_id = self.idgen.channel_id();
+                match self
+                    .sftp
+                    .open(channel_id.clone(), &cwd, conn.out_tx.clone())
+                {
+                    Ok(inbound) => {
+                        conn.register_channel(channel_id.clone(), inbound).await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::SftpOpened(SftpOpened { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::CloseSftp { channel_id } => {
+                self.sftp.close(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // Unreachable: handle_on_connection only routes the six streaming commands here.
+            other => ControlResponse::error(
+                rid,
+                ControlError::unknown_command(format!(
+                    "{} is not a streaming command",
+                    other.name()
+                )),
+            ),
+        }
+    }
 }
 
 impl ControlService for Runtime {
-    async fn handle(&self, request: ControlRequest) -> ControlResponse {
-        self.dispatch(request).await
+    async fn handle_on_connection(
+        &self,
+        request: ControlRequest,
+        conn: &ConnHandle,
+    ) -> ControlResponse {
+        // Streaming commands need this connection's backpressured writer + channel registry; the
+        // rest go through the connection-agnostic dispatch unchanged.
+        match &request.command {
+            Command::AttachSession(_)
+            | Command::DetachSession { .. }
+            | Command::OpenForward(_)
+            | Command::CloseForward { .. }
+            | Command::OpenSftp(_)
+            | Command::CloseSftp { .. } => self.dispatch_streaming(request, conn).await,
+            _ => self.dispatch(request).await,
+        }
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {

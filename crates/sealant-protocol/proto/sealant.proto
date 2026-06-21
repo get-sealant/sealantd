@@ -374,6 +374,18 @@ message ResizePtyArgs { string session_id = 1; uint32 cols = 2; uint32 rows = 3;
 message SetFeatureStateArgs { Feature feature = 1; bool enabled = 2; }
 message Empty {}
 
+enum AttachMode {
+  ATTACH_MODE_UNSPECIFIED = 0;
+  ATTACH_MODE_INTERACTIVE = 1;
+  ATTACH_MODE_OBSERVE = 2;
+}
+message AttachSessionArgs { string session_id = 1; AttachMode mode = 2; }
+message DetachSessionArgs { string channel_id = 1; }
+message OpenForwardArgs { string host = 1; uint32 port = 2; optional string execution_id = 3; }
+message CloseForwardArgs { string channel_id = 1; }
+message OpenSftpArgs { optional string execution_id = 1; optional string cwd = 2; }
+message CloseSftpArgs { string channel_id = 1; }
+
 message Command {
   oneof command {
     Empty runtime_health = 1;
@@ -394,6 +406,12 @@ message Command {
     Empty list_sessions = 16;
     SetFeatureStateArgs set_feature_state = 17;
     Empty get_runtime_metrics = 18;
+    AttachSessionArgs attach_session = 19;
+    DetachSessionArgs detach_session = 20;
+    OpenForwardArgs open_forward = 21;
+    CloseForwardArgs close_forward = 22;
+    OpenSftpArgs open_sftp = 23;
+    CloseSftpArgs close_sftp = 24;
   }
 }
 
@@ -468,6 +486,9 @@ message RuntimeMetrics {
 }
 
 message ShutdownAccepted { uint64 grace_millis = 1; }
+message StreamAttached { string channel_id = 1; }
+message ForwardOpened { string channel_id = 1; }
+message SftpOpened { string channel_id = 1; }
 
 message CommandResult {
   oneof result {
@@ -480,6 +501,9 @@ message CommandResult {
     RuntimeMetrics metrics = 7;
     ShutdownAccepted shutdown_accepted = 8;
     Empty accepted = 9;
+    StreamAttached stream_attached = 10;
+    ForwardOpened forward_opened = 11;
+    SftpOpened sftp_opened = 12;
   }
 }
 
@@ -510,9 +534,24 @@ message ControlResponse {
   ResponseOutcome outcome = 3;
 }
 
+// A reliable byte-conduit frame: raw bytes, a flow-control credit, or a close. Carried over the same
+// length-prefixed stream as requests/responses/events, addressed by channel_id.
+message StreamWindowUpdate { uint64 credits = 1; }
+message StreamEnd { optional int32 exit_code = 1; optional int32 signal = 2; optional string error = 3; }
+message StreamFrame {
+  string channel_id = 1;
+  uint64 seq = 2;
+  oneof payload {
+    bytes data = 3;
+    StreamWindowUpdate window_update = 4;
+    StreamEnd end = 5;
+  }
+}
+
 message ClientMessage {
   oneof message {
     ControlRequest request = 1;
+    StreamFrame stream = 2;
   }
 }
 
@@ -520,5 +559,6 @@ message ServerMessage {
   oneof message {
     ControlResponse response = 1;
     EventEnvelope event = 2;
+    StreamFrame stream = 3;
   }
 }
