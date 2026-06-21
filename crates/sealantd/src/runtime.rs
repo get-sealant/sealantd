@@ -199,6 +199,32 @@ impl Runtime {
         self.processes.registry.clone()
     }
 
+    /// Spawn a managed process through the process runtime so its stdout/stderr flow onto the event
+    /// bus and its lifecycle is registered/reaped like any control-driven `exec`. Used by the boot
+    /// supervisor to run lifecycle steps and the harness with full telemetry.
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] if arguments are invalid or the process cannot be spawned.
+    pub fn spawn_managed(
+        &self,
+        args: sealant_protocol::ExecArgs,
+    ) -> Result<sealant_protocol::ExecAccepted, ControlError> {
+        self.processes.exec(args, None)
+    }
+
+    /// Subscribe to the telemetry event bus (used by the boot supervisor to await a managed
+    /// process's `process.exited`).
+    #[must_use]
+    pub fn event_subscriber(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.bus.subscribe()
+    }
+
+    /// The default execution id, when configured.
+    #[must_use]
+    pub fn default_execution_id(&self) -> Option<ExecutionId> {
+        self.config.default_execution_id.clone()
+    }
+
     /// The configured Unix control-socket path.
     #[must_use]
     pub fn socket_path(&self) -> std::path::PathBuf {
