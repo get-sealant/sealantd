@@ -21,18 +21,30 @@ import {
   SCHEMA_VERSION,
   ClientMessageSchema,
   CommandSchema,
+  StreamFrameSchema,
   ControlErrorCode,
+  AttachMode,
   type CommandResult,
   type Capabilities,
   type ControlError,
   type ControlResponse,
   type EventEnvelope,
   type ExecAccepted,
+  type ForwardOpened,
   type HealthReport,
+  type ProcessAttached,
   type ProcessList,
   type RuntimeMetrics,
   type ServerMessage,
+  type SftpOpened,
+  type StreamAttached,
+  type StreamFrame,
 } from "@sealant/runtime-protocol";
+
+import { Channel, type ChannelTransport } from "./channel.js";
+
+export { Channel } from "./channel.js";
+export type { ChannelTransport, ChannelClose } from "./channel.js";
 
 /** Error raised when the daemon returns a typed control error. */
 export class SealantError extends Error {
@@ -55,6 +67,9 @@ type Pending = {
 
 /** The init shape of the `Command` oneof (what callers pass to {@link SealantClient.request}). */
 type CommandInit = MessageInitShape<typeof CommandSchema>["command"];
+
+/** The init shape of the `StreamFrame.payload` oneof (what {@link SealantClient} muxes outbound). */
+type StreamPayloadInit = MessageInitShape<typeof StreamFrameSchema>["payload"];
 
 /** Throw on an error outcome; otherwise return the `CommandResult`. */
 function okResult(response: ControlResponse): CommandResult {
@@ -99,9 +114,21 @@ export class SealantClient {
   #closed = false;
   #eventQueue: EventEnvelope[] = [];
   #eventWaiters: Array<(result: IteratorResult<EventEnvelope>) => void> = [];
+  /** Demux table: channel_id → open `Channel`. Inbound `ServerMessage::Stream` frames route here. */
+  #channels: Map<string, Channel> = new Map();
+  #transport: ChannelTransport;
 
   constructor(stream: Duplex) {
     this.#stream = stream;
+    // The transport every Channel uses to mux outbound frames back over this one connection.
+    this.#transport = {
+      sendData: (channelId, data) => this.#sendStream(channelId, { case: "data", value: data }),
+      sendWindowUpdate: (channelId, credits) =>
+        this.#sendStream(channelId, { case: "windowUpdate", value: { credits } }),
+      sendEnd: (channelId, end) =>
+        this.#sendStream(channelId, { case: "end", value: end ?? {} }),
+      release: (channelId) => this.#channels.delete(channelId),
+    };
     this.#attach(stream);
   }
 
@@ -192,6 +219,30 @@ export class SealantClient {
     });
   }
 
+  /** Mux one outbound `ClientMessage::Stream` frame onto the shared connection. */
+  #sendStream(channelId: string, payload: StreamPayloadInit): void {
+    if (this.#closed) throw new Error("client is closed");
+    const message = create(ClientMessageSchema, {
+      message: { case: "stream", value: { channelId, seq: 0n, payload } },
+    });
+    this.#stream.write(encodeFrame(encodeClient(message)));
+  }
+
+  /**
+   * Register a {@link Channel} for `channelId` so inbound `ServerMessage::Stream` frames demux into
+   * it and writes mux back out. Low-level: the high-level openers ({@link SealantClient.attachSession},
+   * {@link SealantClient.openForward}, {@link SealantClient.openSftp}, {@link SealantClient.execAttached})
+   * call this with the daemon-allocated id from their result. A multiplexing consumer (the gateway)
+   * can also call it directly when it already holds a channel id.
+   */
+  openChannel(channelId: string): Channel {
+    const existing = this.#channels.get(channelId);
+    if (existing) return existing;
+    const channel = new Channel(channelId, this.#transport);
+    this.#channels.set(channelId, channel);
+    return channel;
+  }
+
   async health(): Promise<HealthReport> {
     return resultValue(okResult(await this.request({ case: "runtimeHealth", value: {} })), "health") as HealthReport;
   }
@@ -246,6 +297,103 @@ export class SealantClient {
     okResult(await this.request({ case: "runtimeGracefulShutdown", value }));
   }
 
+  // ===================== channel multiplexing =====================
+  //
+  // Each opener sends its command, reads the daemon-allocated channel_id out of the typed result, and
+  // returns an open {@link Channel} already wired into the demux table — an async-iterable of that
+  // channel's inbound bytes plus `write`/`windowUpdate`/`end` for outbound bytes.
+
+  /** Attach to an existing PTY session as a multiplexed channel (interactive by default). */
+  async attachSession(
+    sessionId: string,
+    mode: AttachMode = AttachMode.INTERACTIVE,
+  ): Promise<{ result: StreamAttached; channel: Channel }> {
+    const result = resultValue(
+      okResult(await this.request({ case: "attachSession", value: { sessionId, mode } })),
+      "streamAttached",
+    ) as StreamAttached;
+    return { result, channel: this.openChannel(result.channelId) };
+  }
+
+  /** Detach a previously attached session channel and tear down its local {@link Channel}. */
+  async detachSession(channelId: string): Promise<void> {
+    okResult(await this.request({ case: "detachSession", value: { channelId } }));
+    this.#channels.get(channelId)?.end();
+  }
+
+  /** Open a direct-TCP forward to `host:port` as a multiplexed byte channel. */
+  async openForward(
+    host: string,
+    port: number,
+    executionId?: string,
+  ): Promise<{ result: ForwardOpened; channel: Channel }> {
+    const result = resultValue(
+      okResult(await this.request({ case: "openForward", value: { host, port, executionId } })),
+      "forwardOpened",
+    ) as ForwardOpened;
+    return { result, channel: this.openChannel(result.channelId) };
+  }
+
+  /** Close a forward channel and tear down its local {@link Channel}. */
+  async closeForward(channelId: string): Promise<void> {
+    okResult(await this.request({ case: "closeForward", value: { channelId } }));
+    this.#channels.get(channelId)?.end();
+  }
+
+  /** Open an SFTP subsystem channel as a multiplexed byte channel. */
+  async openSftp(options: { executionId?: string; cwd?: string } = {}): Promise<{
+    result: SftpOpened;
+    channel: Channel;
+  }> {
+    const result = resultValue(
+      okResult(
+        await this.request({
+          case: "openSftp",
+          value: { executionId: options.executionId, cwd: options.cwd },
+        }),
+      ),
+      "sftpOpened",
+    ) as SftpOpened;
+    return { result, channel: this.openChannel(result.channelId) };
+  }
+
+  /** Close an SFTP channel and tear down its local {@link Channel}. */
+  async closeSftp(channelId: string): Promise<void> {
+    okResult(await this.request({ case: "closeSftp", value: { channelId } }));
+    this.#channels.get(channelId)?.end();
+  }
+
+  /**
+   * Exec with `attach=true`: the daemon allocates a byte channel bound to the process's stdio and
+   * returns {@link ProcessAttached} with its `channelId`. Returns the typed result plus the open
+   * {@link Channel} (stdout/stderr ride inbound frames; stdin rides outbound `write`).
+   */
+  async execAttached(
+    options: ExecOptions,
+  ): Promise<{ result: ProcessAttached; channel: Channel }> {
+    const result = resultValue(
+      okResult(
+        await this.request({
+          case: "exec",
+          value: {
+            executable: options.executable,
+            args: options.args ?? [],
+            executionId: options.executionId,
+            sessionId: options.sessionId,
+            cwd: options.cwd,
+            stdin: options.stdin ?? false,
+            timeoutMillis:
+              options.timeoutMillis === undefined ? undefined : BigInt(options.timeoutMillis),
+            background: options.background ?? false,
+            attach: true,
+          },
+        }),
+      ),
+      "processAttached",
+    ) as ProcessAttached;
+    return { result, channel: this.openChannel(result.channelId) };
+  }
+
   /** Async iterator over telemetry events (typed `EventEnvelope`; `payload` is a discriminated union). */
   events(): AsyncIterableIterator<EventEnvelope> {
     const self = this;
@@ -291,7 +439,31 @@ export class SealantClient {
         }
       } else if (message.message.case === "event") {
         this.#emitEvent(message.message.value);
+      } else if (message.message.case === "stream") {
+        this.#routeStream(message.message.value);
       }
+    }
+  }
+
+  /** Demultiplex one inbound `ServerMessage::Stream` frame into its `Channel` by `channelId`. */
+  #routeStream(frame: StreamFrame): void {
+    const channel = this.#channels.get(frame.channelId);
+    if (!channel) {
+      // Frame for an unknown/already-closed channel: nothing to deliver to. Drop it.
+      return;
+    }
+    switch (frame.payload.case) {
+      case "data":
+        channel.pushData(frame.payload.value);
+        break;
+      case "windowUpdate":
+        channel.pushWindowUpdate(frame.payload.value);
+        break;
+      case "end":
+        channel.pushEnd(frame.payload.value);
+        break;
+      default:
+        break;
     }
   }
 
@@ -313,6 +485,11 @@ export class SealantClient {
       pending.reject(new Error("connection closed"));
     }
     this.#pending.clear();
+    // Fail every open channel so consumers iterating their bytes/`closed` promise unblock.
+    for (const channel of [...this.#channels.values()]) {
+      channel.fail(new Error("connection closed"));
+    }
+    this.#channels.clear();
   }
 }
 
