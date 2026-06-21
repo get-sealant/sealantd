@@ -7,6 +7,7 @@ use crate::command::{Command, CommandResult};
 use crate::error::ControlError;
 use crate::event::EventEnvelope;
 use crate::ids::RequestId;
+use crate::stream::StreamFrame;
 
 /// A request from a control client to the daemon.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -102,6 +103,8 @@ impl ControlResponse {
 pub enum ClientMessage {
     /// A control request.
     Request(ControlRequest),
+    /// Inbound bytes/credits/close on a byte conduit (gateway → far end). Reuses [`StreamFrame`].
+    Stream(StreamFrame),
 }
 
 impl From<ControlRequest> for ClientMessage {
@@ -118,6 +121,8 @@ pub enum ServerMessage {
     Response(ControlResponse),
     /// An asynchronous telemetry event.
     Event(EventEnvelope),
+    /// Outbound bytes/credits/close on a byte conduit (far end → gateway). Reuses [`StreamFrame`].
+    Stream(StreamFrame),
 }
 
 impl From<ControlResponse> for ServerMessage {
@@ -129,6 +134,18 @@ impl From<ControlResponse> for ServerMessage {
 impl From<EventEnvelope> for ServerMessage {
     fn from(event: EventEnvelope) -> Self {
         Self::Event(event)
+    }
+}
+
+impl From<StreamFrame> for ServerMessage {
+    fn from(frame: StreamFrame) -> Self {
+        Self::Stream(frame)
+    }
+}
+
+impl From<StreamFrame> for ClientMessage {
+    fn from(frame: StreamFrame) -> Self {
+        Self::Stream(frame)
     }
 }
 
@@ -151,6 +168,7 @@ mod tests {
                 cwd: None,
                 env: vec![],
                 stdin: false,
+                attach: false,
                 timeout_millis: None,
                 background: false,
                 capture: None,

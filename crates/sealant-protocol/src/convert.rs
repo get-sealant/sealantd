@@ -4,19 +4,21 @@
 use prost::Message as _;
 
 use crate::ids::{
-    EventId, ExecutionId, MonotonicNanos, ProcessId, RequestId, RuntimeId, Sequence, SessionId,
-    StreamOffset, WallClockMicros,
+    ChannelId, EventId, ExecutionId, MonotonicNanos, ProcessId, RequestId, RuntimeId, Sequence,
+    SessionId, StreamOffset, WallClockMicros,
 };
 use crate::wire;
 use crate::{
-    ArtifactRef, Base64Bytes, Capabilities, CaptureMethod, CaptureMode, CapturePolicy,
-    ClientMessage, Command, CommandResult, Confidence, ControlError, ControlErrorCode,
-    ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope, EventPayload, ExecAccepted,
-    ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix, FeatureState, HealthReport,
-    IoChunk, Limits, NetworkMode, OpenSessionArgs, ProcessExited, ProcessList, ProcessStarted,
+    ArtifactRef, AttachMode, AttachSessionArgs, Base64Bytes, Capabilities, CaptureMethod,
+    CaptureMode, CapturePolicy, ClientMessage, Command, CommandResult, Confidence, ControlError,
+    ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
+    EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
+    FeatureState, ForwardOpened, HealthReport, IoChunk, Limits, NetworkMode, OpenForwardArgs,
+    OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList, ProcessStarted,
     ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
-    RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary,
-    ShutdownAccepted, Signal, StreamKind, TelemetryDropped, TransformMeta,
+    RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
+    ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
+    TelemetryDropped, TransformMeta,
 };
 use crate::{
     FileChange, FileChangeKind, FileDiffAvailable, FileEntry, FileSnapshotCompleted, FileType,
@@ -138,6 +140,12 @@ enum_pair!(
     Signal,
     wire::Signal,
     [Hup, Int, Quit, Term, Kill, Usr1, Usr2, Stop, Cont]
+);
+enum_pair!(
+    attach_mode,
+    AttachMode,
+    wire::AttachMode,
+    [Interactive, Observe]
 );
 enum_pair!(
     capture_mode,
@@ -731,6 +739,7 @@ impl From<ExecArgs> for wire::ExecArgs {
             background: a.background,
             capture: a.capture.map(Into::into),
             graceful_signal: a.graceful_signal.map(enum_i32::<_, wire::Signal>),
+            attach: a.attach,
         }
     }
 }
@@ -749,6 +758,7 @@ impl TryFrom<wire::ExecArgs> for ExecArgs {
             background: a.background,
             capture: a.capture.map(TryInto::try_into).transpose()?,
             graceful_signal: a.graceful_signal.map(signal).transpose()?,
+            attach: a.attach,
         })
     }
 }
@@ -780,6 +790,60 @@ impl TryFrom<wire::OpenSessionArgs> for OpenSessionArgs {
             rows: a.rows as u16,
             term: a.term,
         })
+    }
+}
+
+impl From<AttachSessionArgs> for wire::AttachSessionArgs {
+    fn from(a: AttachSessionArgs) -> Self {
+        Self {
+            session_id: a.session_id.into_inner(),
+            mode: enum_i32::<_, wire::AttachMode>(a.mode),
+        }
+    }
+}
+impl TryFrom<wire::AttachSessionArgs> for AttachSessionArgs {
+    type Error = WireError;
+    fn try_from(a: wire::AttachSessionArgs) -> Result<Self, WireError> {
+        Ok(Self {
+            session_id: SessionId::new(a.session_id),
+            mode: attach_mode(a.mode)?,
+        })
+    }
+}
+
+impl From<OpenForwardArgs> for wire::OpenForwardArgs {
+    fn from(a: OpenForwardArgs) -> Self {
+        Self {
+            host: a.host,
+            port: u32::from(a.port),
+            execution_id: opt_id(a.execution_id),
+        }
+    }
+}
+impl From<wire::OpenForwardArgs> for OpenForwardArgs {
+    fn from(a: wire::OpenForwardArgs) -> Self {
+        Self {
+            host: a.host,
+            port: a.port as u16,
+            execution_id: a.execution_id.map(ExecutionId::new),
+        }
+    }
+}
+
+impl From<OpenSftpArgs> for wire::OpenSftpArgs {
+    fn from(a: OpenSftpArgs) -> Self {
+        Self {
+            execution_id: opt_id(a.execution_id),
+            cwd: a.cwd,
+        }
+    }
+}
+impl From<wire::OpenSftpArgs> for OpenSftpArgs {
+    fn from(a: wire::OpenSftpArgs) -> Self {
+        Self {
+            execution_id: a.execution_id.map(ExecutionId::new),
+            cwd: a.cwd,
+        }
     }
 }
 
@@ -859,6 +923,18 @@ impl From<Command> for wire::command::Command {
                 enabled,
             }),
             Command::GetRuntimeMetrics => W::GetRuntimeMetrics(wire::Empty {}),
+            Command::AttachSession(a) => W::AttachSession(a.into()),
+            Command::DetachSession { channel_id } => W::DetachSession(wire::DetachSessionArgs {
+                channel_id: channel_id.into_inner(),
+            }),
+            Command::OpenForward(a) => W::OpenForward(a.into()),
+            Command::CloseForward { channel_id } => W::CloseForward(wire::CloseForwardArgs {
+                channel_id: channel_id.into_inner(),
+            }),
+            Command::OpenSftp(a) => W::OpenSftp(a.into()),
+            Command::CloseSftp { channel_id } => W::CloseSftp(wire::CloseSftpArgs {
+                channel_id: channel_id.into_inner(),
+            }),
         }
     }
 }
@@ -912,6 +988,18 @@ impl TryFrom<wire::command::Command> for Command {
                 enabled: a.enabled,
             },
             W::GetRuntimeMetrics(_) => Command::GetRuntimeMetrics,
+            W::AttachSession(a) => Command::AttachSession(a.try_into()?),
+            W::DetachSession(a) => Command::DetachSession {
+                channel_id: ChannelId::new(a.channel_id),
+            },
+            W::OpenForward(a) => Command::OpenForward(a.into()),
+            W::CloseForward(a) => Command::CloseForward {
+                channel_id: ChannelId::new(a.channel_id),
+            },
+            W::OpenSftp(a) => Command::OpenSftp(a.into()),
+            W::CloseSftp(a) => Command::CloseSftp {
+                channel_id: ChannelId::new(a.channel_id),
+            },
         })
     }
 }
@@ -1099,6 +1187,21 @@ impl From<CommandResult> for wire::command_result::Result {
             CommandResult::ShutdownAccepted(s) => W::ShutdownAccepted(wire::ShutdownAccepted {
                 grace_millis: s.grace_millis,
             }),
+            CommandResult::StreamAttached(s) => W::StreamAttached(wire::StreamAttached {
+                channel_id: s.channel_id.into_inner(),
+            }),
+            CommandResult::ProcessAttached(p) => W::ProcessAttached(wire::ProcessAttached {
+                process_id: p.process_id.into_inner(),
+                pid: p.pid,
+                pgid: p.pgid,
+                channel_id: p.channel_id.into_inner(),
+            }),
+            CommandResult::ForwardOpened(f) => W::ForwardOpened(wire::ForwardOpened {
+                channel_id: f.channel_id.into_inner(),
+            }),
+            CommandResult::SftpOpened(s) => W::SftpOpened(wire::SftpOpened {
+                channel_id: s.channel_id.into_inner(),
+            }),
             CommandResult::Accepted => W::Accepted(wire::Empty {}),
         }
     }
@@ -1143,6 +1246,21 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
             }),
             W::ShutdownAccepted(s) => CommandResult::ShutdownAccepted(ShutdownAccepted {
                 grace_millis: s.grace_millis,
+            }),
+            W::StreamAttached(s) => CommandResult::StreamAttached(StreamAttached {
+                channel_id: ChannelId::new(s.channel_id),
+            }),
+            W::ProcessAttached(p) => CommandResult::ProcessAttached(ProcessAttached {
+                process_id: ProcessId::new(p.process_id),
+                pid: p.pid,
+                pgid: p.pgid,
+                channel_id: ChannelId::new(p.channel_id),
+            }),
+            W::ForwardOpened(f) => CommandResult::ForwardOpened(ForwardOpened {
+                channel_id: ChannelId::new(f.channel_id),
+            }),
+            W::SftpOpened(s) => CommandResult::SftpOpened(SftpOpened {
+                channel_id: ChannelId::new(s.channel_id),
             }),
             W::Accepted(_) => CommandResult::Accepted,
         })
@@ -1254,22 +1372,80 @@ impl TryFrom<wire::ControlResponse> for ControlResponse {
     }
 }
 
+// ---------- stream frames ----------
+//
+// `StreamPayload::Data` carries raw bytes verbatim; it must never travel through any telemetry
+// redaction/coalescing path. These conversions are the only transformation applied (domain<->wire).
+
+/// Convert a domain [`StreamFrame`] to its wire form.
+#[must_use]
+pub fn stream_frame_to_wire(frame: StreamFrame) -> wire::StreamFrame {
+    use wire::stream_frame::Payload as W;
+    let payload = match frame.payload {
+        StreamPayload::Data { data } => W::Data(data.into_inner()),
+        StreamPayload::WindowUpdate { credits } => {
+            W::WindowUpdate(wire::StreamWindowUpdate { credits })
+        }
+        StreamPayload::End(end) => W::End(wire::StreamEnd {
+            exit_code: end.exit_code,
+            signal: end.signal,
+            error: end.error,
+        }),
+    };
+    wire::StreamFrame {
+        channel_id: frame.channel_id.into_inner(),
+        seq: frame.seq,
+        payload: Some(payload),
+    }
+}
+
+/// Convert a wire [`wire::StreamFrame`] back to the domain type.
+///
+/// # Errors
+/// Returns [`WireError`] if the `payload` oneof is absent.
+pub fn stream_frame_from_wire(frame: wire::StreamFrame) -> Result<StreamFrame, WireError> {
+    use wire::stream_frame::Payload as W;
+    let payload = match frame
+        .payload
+        .ok_or(WireError::MissingOneof("StreamFrame.payload"))?
+    {
+        W::Data(bytes) => StreamPayload::data(bytes),
+        W::WindowUpdate(u) => StreamPayload::WindowUpdate { credits: u.credits },
+        W::End(e) => StreamPayload::End(StreamEnd {
+            exit_code: e.exit_code,
+            signal: e.signal,
+            error: e.error,
+        }),
+    };
+    Ok(StreamFrame {
+        channel_id: ChannelId::new(frame.channel_id),
+        seq: frame.seq,
+        payload,
+    })
+}
+
 impl From<ClientMessage> for wire::ClientMessage {
     fn from(m: ClientMessage) -> Self {
-        let ClientMessage::Request(r) = m;
+        use wire::client_message::Message as W;
+        let message = match m {
+            ClientMessage::Request(r) => W::Request(r.into()),
+            ClientMessage::Stream(f) => W::Stream(stream_frame_to_wire(f)),
+        };
         Self {
-            message: Some(wire::client_message::Message::Request(r.into())),
+            message: Some(message),
         }
     }
 }
 impl TryFrom<wire::ClientMessage> for ClientMessage {
     type Error = WireError;
     fn try_from(m: wire::ClientMessage) -> Result<Self, WireError> {
+        use wire::client_message::Message as W;
         match m
             .message
             .ok_or(WireError::MissingOneof("ClientMessage.message"))?
         {
-            wire::client_message::Message::Request(r) => Ok(ClientMessage::Request(r.try_into()?)),
+            W::Request(r) => Ok(ClientMessage::Request(r.try_into()?)),
+            W::Stream(f) => Ok(ClientMessage::Stream(stream_frame_from_wire(f)?)),
         }
     }
 }
@@ -1280,6 +1456,7 @@ impl From<ServerMessage> for wire::ServerMessage {
         let message = match m {
             ServerMessage::Response(r) => W::Response(r.into()),
             ServerMessage::Event(e) => W::Event(e.into()),
+            ServerMessage::Stream(f) => W::Stream(stream_frame_to_wire(f)),
         };
         Self {
             message: Some(message),
@@ -1296,6 +1473,7 @@ impl TryFrom<wire::ServerMessage> for ServerMessage {
         {
             W::Response(r) => Ok(ServerMessage::Response(r.try_into()?)),
             W::Event(e) => Ok(ServerMessage::Event(e.try_into()?)),
+            W::Stream(f) => Ok(ServerMessage::Stream(stream_frame_from_wire(f)?)),
         }
     }
 }
@@ -1364,6 +1542,7 @@ mod tests {
                     value: "b".into(),
                 }],
                 stdin: true,
+                attach: true,
                 timeout_millis: Some(5000),
                 background: false,
                 capture: None,
@@ -1404,6 +1583,112 @@ mod tests {
         let bytes = encode_server(&msg);
         let back = decode_server(&bytes).expect("decode");
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn client_stream_data_round_trips_binary_safe() {
+        // Raw bytes including NUL and invalid UTF-8 must survive verbatim (no redaction path).
+        let raw = vec![0u8, 0xff, b'a', 0x00, 0xfe, b'\n'];
+        let msg =
+            ClientMessage::Stream(StreamFrame::data(ChannelId::new("chan_7"), 42, raw.clone()));
+        let bytes = encode_client(&msg);
+        let back = decode_client(&bytes).expect("decode");
+        assert_eq!(back, msg);
+        match back {
+            ClientMessage::Stream(StreamFrame {
+                payload: StreamPayload::Data { data },
+                seq,
+                ..
+            }) => {
+                assert_eq!(data.as_slice(), raw.as_slice());
+                assert_eq!(seq, 42);
+            }
+            other => panic!("expected stream data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_stream_end_round_trips() {
+        let msg = ServerMessage::Stream(StreamFrame::end(
+            ChannelId::new("chan_8"),
+            1,
+            StreamEnd {
+                exit_code: Some(7),
+                signal: None,
+                error: None,
+            },
+        ));
+        let bytes = encode_server(&msg);
+        assert_eq!(decode_server(&bytes).expect("decode"), msg);
+    }
+
+    #[test]
+    fn server_stream_window_update_round_trips() {
+        let msg = ServerMessage::Stream(StreamFrame::window_update(
+            ChannelId::new("chan_9"),
+            2,
+            4096,
+        ));
+        let bytes = encode_server(&msg);
+        assert_eq!(decode_server(&bytes).expect("decode"), msg);
+    }
+
+    #[test]
+    fn attach_session_command_round_trips() {
+        let msg = ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_a"),
+            Command::AttachSession(AttachSessionArgs {
+                session_id: SessionId::new("ses_1"),
+                mode: AttachMode::Interactive,
+            }),
+        ));
+        let bytes = encode_client(&msg);
+        assert_eq!(decode_client(&bytes).expect("decode"), msg);
+    }
+
+    #[test]
+    fn open_forward_command_and_result_round_trip() {
+        let msg = ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_f"),
+            Command::OpenForward(OpenForwardArgs {
+                host: "127.0.0.1".to_owned(),
+                port: 8000,
+                execution_id: Some(ExecutionId::new("run-1")),
+            }),
+        ));
+        let bytes = encode_client(&msg);
+        assert_eq!(decode_client(&bytes).expect("decode"), msg);
+
+        let result = ServerMessage::Response(ControlResponse::ok_with(
+            RequestId::new("req_f"),
+            CommandResult::ForwardOpened(ForwardOpened {
+                channel_id: ChannelId::new("chan_f"),
+            }),
+        ));
+        let rbytes = encode_server(&result);
+        assert_eq!(decode_server(&rbytes).expect("decode"), result);
+    }
+
+    #[test]
+    fn open_sftp_command_and_result_round_trip() {
+        let msg = ClientMessage::Request(ControlRequest::new(
+            RequestId::new("req_s"),
+            Command::OpenSftp(OpenSftpArgs {
+                execution_id: None,
+                cwd: Some("/work".to_owned()),
+            }),
+        ));
+        let bytes = encode_client(&msg);
+        assert_eq!(decode_client(&bytes).expect("decode"), msg);
+
+        let result = ServerMessage::Response(ControlResponse::ok_with(
+            RequestId::new("req_s"),
+            CommandResult::SftpOpened(SftpOpened {
+                channel_id: ChannelId::new("chan_s"),
+            }),
+        ));
+        let rbytes = encode_server(&result);
+        assert_eq!(decode_server(&rbytes).expect("decode"), result);
     }
 
     #[test]

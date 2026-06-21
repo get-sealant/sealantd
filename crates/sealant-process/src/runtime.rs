@@ -5,17 +5,63 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sealant_protocol::{
-    CaptureMethod, CaptureMode, Confidence, ControlError, ControlErrorCode, Encoding, EventPayload,
-    ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId, ProcessStarted,
-    ProcessState, ProcessSummary, RequestId, Signal, StreamKind, StreamOffset, TransformMeta,
+    CaptureMethod, CaptureMode, ChannelId, Confidence, ControlError, ControlErrorCode, Encoding,
+    EventPayload, ExecAccepted, ExecArgs, ExitReason, IoChunk, ProcessExited, ProcessId,
+    ProcessStarted, ProcessState, ProcessSummary, RequestId, ServerMessage, Signal, StreamEnd,
+    StreamFrame, StreamKind, StreamOffset, TransformMeta,
 };
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
 use sealant_telemetry::{Correlation, EventBus};
 use std::os::unix::process::ExitStatusExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc;
 
 use crate::registry::{ProcessEntry, ProcessRegistry};
 use crate::signals;
+
+/// A reliable exec-attach output sink: a non-PTY process's stdout/stderr is delivered over one
+/// gateway connection's backpressured outbound queue as raw [`StreamFrame::Data`], distinct from the
+/// lossy `IoChunk` telemetry tap (§1.A exec-attach). The stdout and stderr capture tasks share a
+/// single sink (and thus a single per-channel `seq`) so the gateway sees one ordered byte stream —
+/// exactly mirroring the PTY session-attach machinery.
+///
+/// Awaiting `out_tx.send(...)` is the backpressure: a capture task only reads its next pipe chunk
+/// once the gateway accepts the previous one, so a slow gateway throttles the pipe drain and the
+/// kernel pipe buffer backpressures the process. The bytes are forwarded raw (never redacted or
+/// coalesced); the parallel `IoChunk` tap keeps applying redaction independently.
+#[derive(Debug, Clone)]
+pub struct AttachSink {
+    /// The channel the process output streams on.
+    pub channel_id: ChannelId,
+    /// The connection's backpressured outbound queue.
+    pub out_tx: mpsc::Sender<ServerMessage>,
+    /// Per-channel monotonic data-frame counter, shared across stdout+stderr (gap detection only).
+    seq: Arc<AtomicU64>,
+}
+
+impl AttachSink {
+    /// Create a fresh attach sink for `channel_id` bound to the connection's `out_tx`.
+    #[must_use]
+    pub fn new(channel_id: ChannelId, out_tx: mpsc::Sender<ServerMessage>) -> Self {
+        Self {
+            channel_id,
+            out_tx,
+            seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Forward one raw chunk over the channel, awaiting the send (backpressure). Returns `Err(())`
+    /// once the gateway queue is closed so the caller stops trying.
+    async fn forward(&self, data: &[u8]) -> Result<(), ()> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let frame = StreamFrame::data(self.channel_id.clone(), seq, data);
+        self.out_tx
+            .send(ServerMessage::Stream(frame))
+            .await
+            .map_err(|_| ())
+    }
+}
 
 /// Composition of the dependencies needed to run processes.
 #[derive(Debug, Clone)]
@@ -65,6 +111,34 @@ impl ProcessRuntime {
         &self,
         args: ExecArgs,
         request_id: Option<RequestId>,
+    ) -> Result<ExecAccepted, ControlError> {
+        self.exec_inner(args, request_id, None)
+    }
+
+    /// Spawn a non-interactive process with its stdout/stderr additionally bound to a reliable
+    /// exec-attach channel (§1.A exec-attach). The attach binding is established atomically at spawn
+    /// — before any pipe byte is read — so the initial output burst that VSCode's bootstrap reads is
+    /// never lost. The lossy `IoChunk` telemetry tap stays on in parallel. A final
+    /// `StreamFrame::End{exit_code}` is emitted on the channel when the process exits.
+    ///
+    /// # Errors
+    /// Returns a [`ControlError`] if arguments are invalid or the process cannot be spawned.
+    pub fn exec_attached(
+        &self,
+        args: ExecArgs,
+        request_id: Option<RequestId>,
+        channel_id: ChannelId,
+        out_tx: mpsc::Sender<ServerMessage>,
+    ) -> Result<ExecAccepted, ControlError> {
+        let sink = AttachSink::new(channel_id, out_tx);
+        self.exec_inner(args, request_id, Some(sink))
+    }
+
+    fn exec_inner(
+        &self,
+        args: ExecArgs,
+        request_id: Option<RequestId>,
+        attach: Option<AttachSink>,
     ) -> Result<ExecAccepted, ControlError> {
         if args.executable.trim().is_empty() {
             return Err(ControlError::invalid_argument(
@@ -172,6 +246,8 @@ impl ProcessRuntime {
         );
 
         let chunk_size = self.config.io_chunk_bytes;
+        // Both stdout and stderr fan into the SAME attach sink (shared seq) so the gateway sees one
+        // ordered byte stream — exactly like a PTY attach.
         let stdout_handle = stdout.map(|s| {
             let bus = self.bus.clone();
             let corr = correlation.clone();
@@ -184,6 +260,7 @@ impl ProcessRuntime {
                 corr,
                 self.redactor.clone(),
                 self.status.clone(),
+                attach.clone(),
             ))
         });
         let stderr_handle = stderr.map(|s| {
@@ -198,6 +275,7 @@ impl ProcessRuntime {
                 corr,
                 self.redactor.clone(),
                 self.status.clone(),
+                attach.clone(),
             ))
         });
 
@@ -208,6 +286,7 @@ impl ProcessRuntime {
         let waiter_status = self.status.clone();
         let waiter_entry = entry;
         let waiter_proc = process_id.clone();
+        let waiter_attach = attach;
         tokio::spawn(async move {
             let start = Instant::now();
             let outcome = run_to_exit(child, pgid, timeout, grace).await;
@@ -217,6 +296,21 @@ impl ProcessRuntime {
             }
             if let Some(handle) = stderr_handle {
                 let _ = handle.await;
+            }
+            // Both capture tasks have joined, so by here the attach channel has received every byte
+            // of stdout/stderr. Emit a final End{exit_code, signal} so the gateway maps the exec
+            // channel's exit-status (the lossless analogue of the IoChunk→ProcessExited telemetry).
+            if let Some(sink) = waiter_attach {
+                let end = StreamFrame::end(
+                    sink.channel_id.clone(),
+                    u64::MAX,
+                    StreamEnd {
+                        exit_code: outcome.exit_code,
+                        signal: outcome.signal,
+                        error: None,
+                    },
+                );
+                let _ = sink.out_tx.send(ServerMessage::Stream(end)).await;
             }
             let duration_micros = start.elapsed().as_micros() as u64;
             waiter_entry.set_state(outcome.state);
@@ -411,9 +505,11 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     correlation: Correlation,
     redactor: Arc<Redactor>,
     status: Arc<RuntimeStatus>,
+    attach: Option<AttachSink>,
 ) {
-    // Even when disabled we must drain the pipe so the child does not block on a full buffer.
-    if matches!(mode, CaptureMode::Disabled) {
+    // When attached we must read every byte even if telemetry capture is disabled, so the reliable
+    // exec-attach stream stays lossless. When neither capture nor attach is active we just drain.
+    if matches!(mode, CaptureMode::Disabled) && attach.is_none() {
         let mut sink = [0u8; 8192];
         loop {
             match reader.read(&mut sink).await {
@@ -426,12 +522,31 @@ async fn capture_stream<R: AsyncRead + Unpin>(
 
     let mut offset = StreamOffset::ZERO;
     let mut buf = vec![0u8; chunk_size.max(1)];
+    let mut attach = attach;
     loop {
         let n = match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
+
+        // (b) reliable exec-attach fan-out (backpressured, RAW bytes, never redacted). Sharing this
+        // single reader means the attach stream sees every byte; awaiting the send throttles this
+        // loop's next read so a slow gateway backpressures the process — the inverse of the lossy
+        // IoChunk tap below. Done before the telemetry publish so attach ordering is independent of
+        // capture mode. If the gateway queue is closed, drop the sink and keep draining for telemetry.
+        if let Some(sink) = &attach
+            && sink.forward(&buf[..n]).await.is_err()
+        {
+            attach = None;
+        }
+
+        // (a) lossy telemetry tap (always on, redaction applies here only). When capture is disabled
+        // but we are attached, skip emitting a telemetry chunk (we only read to feed the attach).
+        if matches!(mode, CaptureMode::Disabled) {
+            offset = offset.advance(n as u64);
+            continue;
+        }
         let (content, byte_count, transform) = if matches!(mode, CaptureMode::Full) {
             let (data, redacted) = redactor.redact(&buf[..n]);
             if redacted > 0 {
@@ -535,6 +650,7 @@ mod tests {
             cwd: None,
             env: vec![],
             stdin: false,
+            attach: false,
             timeout_millis: None,
             background: false,
             capture: None,

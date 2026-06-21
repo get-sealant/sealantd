@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bytes::Base64Bytes;
 use crate::event::{Feature, ProcessState, RuntimeState};
-use crate::ids::{ExecutionId, ProcessId, RuntimeId, SessionId, WallClockMicros};
+use crate::ids::{ChannelId, ExecutionId, ProcessId, RuntimeId, SessionId, WallClockMicros};
 
 /// A POSIX signal that may be delivered to a managed process group.
 ///
@@ -144,6 +144,16 @@ pub struct ExecArgs {
     /// Open a stdin pipe so the client can `writeStdin`.
     #[serde(default)]
     pub stdin: bool,
+    /// Bind this process's stdout/stderr to a fresh reliable [`ChannelId`] (exec-attach, §1.A).
+    ///
+    /// When set, the process's combined stdout+stderr is delivered over a backpressured
+    /// `StreamFrame::Data` channel exactly like a session attach — raw bytes, never redacted or
+    /// coalesced, terminated by `StreamFrame::End{exit_code}` on process exit. The result carries the
+    /// minted channel (`ProcessAttached`) instead of the bare `ExecAccepted`. The lossy `IoChunk`
+    /// telemetry tap stays on in parallel; the channel is the faithful path VSCode's non-PTY
+    /// bootstrap reads from. Requires a connection-scoped writer (the request is routed accordingly).
+    #[serde(default)]
+    pub attach: bool,
     /// Timeout after which the process is terminated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_millis: Option<u64>,
@@ -210,6 +220,53 @@ pub struct OpenSessionArgs {
     /// `TERM` value to advertise to the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
+}
+
+/// How a gateway wants to consume a session's reliable output stream.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum AttachMode {
+    /// Interactive: the attaching connection drives input and consumes output.
+    #[default]
+    Interactive,
+    /// Observe: a read-only mirror of the session's output.
+    Observe,
+}
+
+/// Arguments to `attachSession`: bind a session's PTY output to a fresh reliable channel.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachSessionArgs {
+    /// Session whose output to stream.
+    pub session_id: SessionId,
+    /// Consumption mode.
+    #[serde(default)]
+    pub mode: AttachMode,
+}
+
+/// Arguments to `openForward` (direct-tcpip): open a TCP connection from inside the container.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenForwardArgs {
+    /// Destination host (resolved inside the container).
+    pub host: String,
+    /// Destination port.
+    pub port: u16,
+    /// Execution to correlate the forward with, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+}
+
+/// Arguments to `openSftp`: spawn an in-container `sftp-server` bound to a reliable channel.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenSftpArgs {
+    /// Execution to correlate the bridge with, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<ExecutionId>,
+    /// Working directory for the sftp-server process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// The set of control commands. Adjacently tagged: `{ "cmd": ..., "args": ... }`.
@@ -306,6 +363,33 @@ pub enum Command {
     /// Report runtime metrics.
     #[serde(rename = "getRuntimeMetrics")]
     GetRuntimeMetrics,
+    /// Attach a fresh reliable output channel to a session's PTY.
+    #[serde(rename = "attachSession")]
+    AttachSession(AttachSessionArgs),
+    /// Detach (and close) a previously attached session channel.
+    #[serde(rename = "detachSession")]
+    DetachSession {
+        /// Channel to detach.
+        channel_id: ChannelId,
+    },
+    /// Open a direct-tcpip forward (container → host:port) bound to a reliable channel.
+    #[serde(rename = "openForward")]
+    OpenForward(OpenForwardArgs),
+    /// Close a previously opened forward.
+    #[serde(rename = "closeForward")]
+    CloseForward {
+        /// Channel to close.
+        channel_id: ChannelId,
+    },
+    /// Open an SFTP bridge (in-container `sftp-server` stdio) bound to a reliable channel.
+    #[serde(rename = "openSftp")]
+    OpenSftp(OpenSftpArgs),
+    /// Close a previously opened SFTP bridge.
+    #[serde(rename = "closeSftp")]
+    CloseSftp {
+        /// Channel to close.
+        channel_id: ChannelId,
+    },
 }
 
 impl Command {
@@ -331,6 +415,12 @@ impl Command {
             Self::ListSessions => "listSessions",
             Self::SetFeatureState { .. } => "setFeatureState",
             Self::GetRuntimeMetrics => "getRuntimeMetrics",
+            Self::AttachSession(_) => "attachSession",
+            Self::DetachSession { .. } => "detachSession",
+            Self::OpenForward(_) => "openForward",
+            Self::CloseForward { .. } => "closeForward",
+            Self::OpenSftp(_) => "openSftp",
+            Self::CloseSftp { .. } => "closeSftp",
         }
     }
 }
@@ -568,6 +658,46 @@ pub struct ShutdownAccepted {
     pub grace_millis: u64,
 }
 
+/// Result of `attachSession`: the channel the session's output now streams on.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamAttached {
+    /// The newly minted output channel.
+    pub channel_id: ChannelId,
+}
+
+/// Result of an exec-attach (`exec` with `attach: true`): the process was accepted *and* its
+/// stdout/stderr now stream over a fresh reliable channel (§1.A exec-attach). Symmetric to
+/// [`ExecAccepted`] + [`StreamAttached`].
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessAttached {
+    /// Stable logical process id (as in [`ExecAccepted`]).
+    pub process_id: ProcessId,
+    /// OS pid.
+    pub pid: i32,
+    /// OS process group id.
+    pub pgid: i32,
+    /// The newly minted output channel carrying the process's stdout/stderr.
+    pub channel_id: ChannelId,
+}
+
+/// Result of `openForward`: the channel the forwarded TCP bytes now flow on.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardOpened {
+    /// The newly minted forward channel.
+    pub channel_id: ChannelId,
+}
+
+/// Result of `openSftp`: the channel the sftp-server stdio is bridged over.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpOpened {
+    /// The newly minted sftp channel.
+    pub channel_id: ChannelId,
+}
+
 /// The acknowledgement payload carried by a successful [`crate::ControlResponse`].
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -588,6 +718,14 @@ pub enum CommandResult {
     Metrics(RuntimeMetrics),
     /// Shutdown accepted.
     ShutdownAccepted(ShutdownAccepted),
+    /// Session output attached to a channel.
+    StreamAttached(StreamAttached),
+    /// `exec` accepted with its stdout/stderr attached to a channel (exec-attach).
+    ProcessAttached(ProcessAttached),
+    /// A forward was opened on a channel.
+    ForwardOpened(ForwardOpened),
+    /// An SFTP bridge was opened on a channel.
+    SftpOpened(SftpOpened),
     /// Generic acknowledgement with no data.
     Accepted,
 }
@@ -606,6 +744,7 @@ mod tests {
             cwd: None,
             env: vec![],
             stdin: false,
+            attach: false,
             timeout_millis: None,
             background: false,
             capture: None,

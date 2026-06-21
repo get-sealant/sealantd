@@ -5,17 +5,18 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sealant_control::ControlService;
+use sealant_control::{ConnHandle, ControlService};
 use sealant_eventlog::{FsyncPolicy, Spool, SpoolConfig};
 use sealant_fs::snapshot::SnapshotConfig;
 use sealant_fs::{FilesystemConfig, FilesystemRuntime};
-use sealant_network::{NetworkConfig, NetworkRuntime};
-use sealant_process::{ProcessRegistry, ProcessRuntime};
+use sealant_network::{ForwardRuntime, NetworkConfig, NetworkRuntime};
+use sealant_process::{ProcessRegistry, ProcessRuntime, SftpRuntime};
 use sealant_protocol::{
     Capabilities, Command, CommandResult, Confidence, ControlError, ControlRequest,
     ControlResponse, EventEnvelope, EventPayload, ExecutionId, Feature, FeatureMatrix,
-    FeatureState, HealthReport, NetworkMode, ProcessList, ProcessState, RuntimeHeartbeat,
-    RuntimeMetrics, RuntimeState, RuntimeStateChanged, SCHEMA_VERSION, ShutdownAccepted, Signal,
+    FeatureState, ForwardOpened, HealthReport, NetworkMode, ProcessAttached, ProcessList,
+    ProcessState, RuntimeHeartbeat, RuntimeMetrics, RuntimeState, RuntimeStateChanged,
+    SCHEMA_VERSION, SftpOpened, ShutdownAccepted, Signal, StreamAttached,
 };
 use sealant_pty::{SessionRegistry, SessionRuntime};
 use sealant_runtime_core::{Clock, IdGenerator, Redactor, RuntimeConfig, RuntimeStatus};
@@ -106,7 +107,6 @@ fn build_bus(
 pub struct Runtime {
     config: Arc<RuntimeConfig>,
     clock: Arc<Clock>,
-    #[allow(dead_code)]
     idgen: Arc<IdGenerator>,
     status: Arc<RuntimeStatus>,
     bus: Arc<EventBus>,
@@ -114,6 +114,8 @@ pub struct Runtime {
     sessions: SessionRuntime,
     filesystem: Arc<FilesystemRuntime>,
     network: Arc<NetworkRuntime>,
+    forwards: Arc<ForwardRuntime>,
+    sftp: Arc<SftpRuntime>,
     extra_env: Arc<Mutex<Vec<(String, String)>>>,
     shutdown: Arc<ShutdownSignal>,
     features: Mutex<HashMap<Feature, bool>>,
@@ -185,6 +187,8 @@ impl Runtime {
             sessions,
             filesystem,
             network,
+            forwards: Arc::new(ForwardRuntime::new()),
+            sftp: Arc::new(SftpRuntime::new()),
             extra_env,
             shutdown,
             features: Mutex::new(default_feature_states()),
@@ -197,6 +201,25 @@ impl Runtime {
     #[must_use]
     pub fn process_registry(&self) -> Arc<ProcessRegistry> {
         self.processes.registry.clone()
+    }
+
+    /// The interactive-session runtime (used by tests to drive PTY input/attachment directly).
+    #[must_use]
+    pub fn session_runtime(&self) -> &SessionRuntime {
+        &self.sessions
+    }
+
+    /// Number of live direct-tcpip forwards across all connections. Used by tests to assert that
+    /// connection teardown reaps the forward's runtime map entry (no leak per disconnect).
+    #[must_use]
+    pub fn forward_count(&self) -> usize {
+        self.forwards.len()
+    }
+
+    /// Number of live SFTP bridges across all connections (test observability for teardown).
+    #[must_use]
+    pub fn sftp_count(&self) -> usize {
+        self.sftp.len()
     }
 
     /// Spawn a managed process through the process runtime so its stdout/stderr flow onto the event
@@ -565,6 +588,18 @@ impl Runtime {
                 self.set_feature(feature, enabled);
                 ControlResponse::accepted(rid)
             }
+            // Streaming commands are routed through dispatch_streaming (they need the ConnHandle).
+            Command::AttachSession(_)
+            | Command::DetachSession { .. }
+            | Command::OpenForward(_)
+            | Command::CloseForward { .. }
+            | Command::OpenSftp(_)
+            | Command::CloseSftp { .. } => ControlResponse::error(
+                rid,
+                ControlError::unknown_command(
+                    "streaming command requires a connection-scoped writer".to_owned(),
+                ),
+            ),
         }
     }
 
@@ -575,11 +610,216 @@ impl Runtime {
             }
         }
     }
+
+    /// Dispatch the connection-scoped streaming commands (gateway consolidation §1.A/§1.B/§1.C).
+    ///
+    /// Each open binds a fresh [`ChannelId`] to a byte source and pumps it over `conn.out_tx` with
+    /// backpressure; inbound bytes arrive as `ClientMessage::Stream` and are routed by the control
+    /// server to the sink registered here. None of these touch the telemetry `EventBus`.
+    async fn dispatch_streaming(
+        &self,
+        request: ControlRequest,
+        conn: &ConnHandle,
+    ) -> ControlResponse {
+        let rid = request.request_id.clone();
+        if matches!(
+            self.status.state(),
+            RuntimeState::ShuttingDown | RuntimeState::Stopped
+        ) {
+            return ControlResponse::error(
+                rid,
+                ControlError::runtime_shutting_down("runtime is shutting down".to_owned()),
+            );
+        }
+
+        match request.command {
+            // §1.A exec-attach — run a non-PTY process and bind its stdout/stderr to a fresh
+            // reliable channel (VSCode's non-PTY bootstrap reads its output losslessly here).
+            Command::Exec(args) => {
+                let channel_id = self.idgen.channel_id();
+                match self.processes.exec_attached(
+                    args,
+                    Some(rid.clone()),
+                    channel_id.clone(),
+                    conn.out_tx.clone(),
+                ) {
+                    Ok(accepted) => {
+                        // Eager closer: a connection drop kills the attached process group (so a
+                        // disconnected gateway does not leave a bootstrap exec running). The capture
+                        // tasks then hit EOF and exit; the waiter reaps the registry entry.
+                        let processes = self.processes.clone();
+                        let close_proc = accepted.process_id.clone();
+                        conn.register_closer(
+                            channel_id.clone(),
+                            Box::new(move || {
+                                let _ = processes.kill(&close_proc);
+                            }),
+                        )
+                        .await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::ProcessAttached(ProcessAttached {
+                                process_id: accepted.process_id,
+                                pid: accepted.pid,
+                                pgid: accepted.pgid,
+                                channel_id,
+                            }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+
+            // §1.A — attach a session's PTY output to a fresh reliable channel.
+            Command::AttachSession(args) => {
+                let channel_id = self.idgen.channel_id();
+                match self.sessions.attach(
+                    &args.session_id,
+                    channel_id.clone(),
+                    conn.out_tx.clone(),
+                ) {
+                    Ok(()) => {
+                        // No inbound sink for attach: client keystrokes use writeStdin (the PTY is
+                        // the input path). Register an eager closer so a connection drop detaches the
+                        // session (the capture loop stops fanning out) — the same eager teardown path
+                        // as forwards/sftp.
+                        let sessions = self.sessions.clone();
+                        let detach_channel = channel_id.clone();
+                        conn.register_closer(
+                            channel_id.clone(),
+                            Box::new(move || sessions.detach(&detach_channel)),
+                        )
+                        .await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::StreamAttached(StreamAttached { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::DetachSession { channel_id } => {
+                self.sessions.detach(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // §1.B — open a direct-tcpip forward to host:port.
+            //
+            // Forwarding is a gateway *transport* primitive (the SSH direct-tcpip substrate), not
+            // telemetry capture. It is deliberately NOT gated on `Feature::NetworkCollection` — that
+            // kill switch governs whether the daemon *observes/records* network traffic, a separate
+            // concern from whether a tunnel may be opened at all. Like session-attach and SFTP, the
+            // forward is a connection-scoped channel with its own eager teardown; it carries bytes,
+            // it does not capture them.
+            Command::OpenForward(args) => {
+                let channel_id = self.idgen.channel_id();
+                match self
+                    .forwards
+                    .open(
+                        channel_id.clone(),
+                        &args.host,
+                        args.port,
+                        args.execution_id,
+                        conn.out_tx.clone(),
+                    )
+                    .await
+                {
+                    Ok(inbound) => {
+                        conn.register_channel(channel_id.clone(), inbound).await;
+                        // Eager closer: on connection drop, abort BOTH pumps and reap the
+                        // ForwardRuntime map entry. Without this an idle upstream's socket→gateway
+                        // pump blocks on read() forever (it never calls out_tx.send, so never sees
+                        // the closed queue), leaking the task, the socket FD, and the map entry.
+                        let forwards = self.forwards.clone();
+                        let close_channel = channel_id.clone();
+                        conn.register_closer(
+                            channel_id.clone(),
+                            Box::new(move || forwards.close(&close_channel)),
+                        )
+                        .await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::ForwardOpened(ForwardOpened { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::CloseForward { channel_id } => {
+                self.forwards.close(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // §1.C — open an SFTP bridge (in-container sftp-server stdio).
+            Command::OpenSftp(args) => {
+                let cwd = args
+                    .cwd
+                    .map_or_else(|| self.config.workspace_root.clone(), Into::into);
+                let channel_id = self.idgen.channel_id();
+                match self
+                    .sftp
+                    .open(channel_id.clone(), &cwd, conn.out_tx.clone())
+                {
+                    Ok(inbound) => {
+                        conn.register_channel(channel_id.clone(), inbound).await;
+                        // Eager closer: on connection drop, abort all bridge tasks and reap the
+                        // SftpRuntime map entry (kill_on_drop reaps the child). Without this an
+                        // sftp-server that produces no output leaves its stdout→gateway pump blocked
+                        // on read(), leaking the task and the map entry — same hazard as forwards.
+                        let sftp = self.sftp.clone();
+                        let close_channel = channel_id.clone();
+                        conn.register_closer(
+                            channel_id.clone(),
+                            Box::new(move || sftp.close(&close_channel)),
+                        )
+                        .await;
+                        ControlResponse::ok_with(
+                            rid,
+                            CommandResult::SftpOpened(SftpOpened { channel_id }),
+                        )
+                    }
+                    Err(error) => ControlResponse::error(rid, error),
+                }
+            }
+            Command::CloseSftp { channel_id } => {
+                self.sftp.close(&channel_id);
+                conn.deregister_channel(&channel_id).await;
+                ControlResponse::accepted(rid)
+            }
+
+            // Unreachable: handle_on_connection only routes the six streaming commands here.
+            other => ControlResponse::error(
+                rid,
+                ControlError::unknown_command(format!(
+                    "{} is not a streaming command",
+                    other.name()
+                )),
+            ),
+        }
+    }
 }
 
 impl ControlService for Runtime {
-    async fn handle(&self, request: ControlRequest) -> ControlResponse {
-        self.dispatch(request).await
+    async fn handle_on_connection(
+        &self,
+        request: ControlRequest,
+        conn: &ConnHandle,
+    ) -> ControlResponse {
+        // Streaming commands need this connection's backpressured writer + channel registry; the
+        // rest go through the connection-agnostic dispatch unchanged. An `exec` with `attach: true`
+        // is exec-attach (§1.A): it also needs the connection's writer, so route it here too.
+        match &request.command {
+            Command::AttachSession(_)
+            | Command::DetachSession { .. }
+            | Command::OpenForward(_)
+            | Command::CloseForward { .. }
+            | Command::OpenSftp(_)
+            | Command::CloseSftp { .. } => self.dispatch_streaming(request, conn).await,
+            Command::Exec(args) if args.attach => self.dispatch_streaming(request, conn).await,
+            _ => self.dispatch(request).await,
+        }
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {

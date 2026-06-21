@@ -1,18 +1,20 @@
 //! `sealantd boot`: the PID-1 sandbox supervisor.
 //!
 //! `boot` is the container's PID 1. It reproduces every step the legacy bash entrypoint performed —
-//! workspace prep, glibc loader shim, git clone with scoped credentials, SSH bring-up, runtime
-//! dotfiles, lifecycle steps — then runs the control server *in-process* and supervises the harness
-//! (and `sshd`) as managed children. Because it is the subreaper, double-forked orphans reparent
-//! here and are reaped continuously; because the harness runs through the daemon's `exec`, its
-//! stdout/stderr are captured on the event bus. `boot` waits for the harness, propagates signals,
-//! and exits with the harness's status.
+//! workspace prep, glibc loader shim, git clone with scoped credentials, runtime dotfiles, lifecycle
+//! steps — then runs the control server *in-process* and supervises the harness as a managed child.
+//! Because it is the subreaper, double-forked orphans reparent here and are reaped continuously;
+//! because the harness runs through the daemon's `exec`, its stdout/stderr are captured on the event
+//! bus. `boot` waits for the harness, propagates signals, and exits with the harness's status.
+//!
+//! Interactive SSH access is no longer served by an in-container `sshd`: the gateway tunnels to the
+//! daemon over the control socket and drives sessions/forwards through the control protocol. Only the
+//! SSH *client* survives (git-over-SSH clone, see [`git`]).
 
 pub mod config;
 mod dotfiles;
 mod error;
 mod git;
-mod ssh;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,7 +35,7 @@ pub use error::BootError;
 
 use config::{ForegroundConfig, LifecycleStep, OsFamily, Shell};
 
-/// The directory under the sandbox root holding boot-time credentials and SSH runtime state.
+/// The directory under the sandbox root holding boot-time clone credentials and dotfiles state.
 const SSH_RUNTIME_SUBDIR: &str = ".ssh-runtime";
 
 /// Entry point for the `boot` subcommand. Performs synchronous prep, then enters Tokio to run the
@@ -52,7 +54,7 @@ pub fn run_boot(log_level: &str) -> ExitCode {
     };
 
     match prepare(&config) {
-        Ok(prepared) => run_supervised(config, prepared),
+        Ok(()) => run_supervised(config),
         Err(error) => {
             tracing::error!(%error, "boot preparation failed");
             eprintln!("sealantd boot: {error}");
@@ -70,15 +72,10 @@ fn init_tracing(log_level: &str) {
         .try_init();
 }
 
-/// Outputs of the synchronous prep phase that the async supervisor needs.
-struct Prepared {
-    ssh: Option<ssh::SshArtifacts>,
-}
-
-/// Synchronous boot preparation (steps 2–8): all side effects that must complete, in order, before
+/// Synchronous boot preparation (steps 2–7): all side effects that must complete, in order, before
 /// the async runtime and the harness start.
-fn prepare(config: &BootConfig) -> Result<Prepared, BootError> {
-    // Step 2: become subreaper BEFORE any fork so orphans (sshd!) reparent here.
+fn prepare(config: &BootConfig) -> Result<(), BootError> {
+    // Step 2: become subreaper BEFORE any fork so double-forked orphans reparent here.
     if cfg!(target_os = "linux") {
         if !sealant_process::platform::set_child_subreaper() {
             tracing::warn!("PR_SET_CHILD_SUBREAPER failed; orphan reaping may be incomplete");
@@ -104,10 +101,7 @@ fn prepare(config: &BootConfig) -> Result<Prepared, BootError> {
     clone_auth.wipe();
     clone_result?;
 
-    // Step 8: SSH bring-up (artifacts launched later as a managed child).
-    let ssh = ssh::bring_up(config, &runtime_dir)?;
-
-    Ok(Prepared { ssh })
+    Ok(())
 }
 
 /// The SSH-runtime / credential directory under the sandbox root.
@@ -124,8 +118,6 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
         ssh_runtime_dir(config),
         PathBuf::from("/root"),
         PathBuf::from("/tmp"),
-        PathBuf::from("/var/empty"),
-        PathBuf::from("/run/sshd"),
         PathBuf::from("/run/sealant"),
     ];
     if let Some(parent) = config.control.socket.parent() {
@@ -138,8 +130,8 @@ fn prepare_workspace(config: &BootConfig) -> Result<(), BootError> {
     // We deliberately do NOT mutate this process's environment (it is `unsafe` in edition 2024 and
     // this crate forbids unsafe). The harness child's identity (HOME/USER/LOGNAME) and the
     // `/usr/local/bin` PATH prepend are injected explicitly via `child_env` in `harness_child_env`,
-    // which is the only consumer that needs them. The clone/ssh helper commands inherit boot's own
-    // env (PATH already includes the system dirs).
+    // which is the only consumer that needs them. The clone helper commands inherit boot's own env
+    // (PATH already includes the system dirs).
     std::env::set_current_dir(&config.workspace.sandbox_root)
         .map_err(|e| BootError::io_path("chdir", &config.workspace.sandbox_root, e))?;
     Ok(())
@@ -212,7 +204,7 @@ fn harness_child_env(config: &BootConfig) -> Vec<EnvVar> {
     map.insert("HOME".to_owned(), "/root".to_owned());
     map.insert("USER".to_owned(), "root".to_owned());
     map.insert("LOGNAME".to_owned(), "root".to_owned());
-    // Prepend /usr/local/bin (where the ssh shell wrapper and tools live) to the child PATH.
+    // Prepend /usr/local/bin (where local tools live) to the child PATH.
     let base_path = map
         .get("PATH")
         .cloned()
@@ -232,7 +224,7 @@ fn harness_child_env(config: &BootConfig) -> Vec<EnvVar> {
 }
 
 /// Steps 9–18: build the runtime, enter Tokio, run the control server and supervise the harness.
-fn run_supervised(config: BootConfig, prepared: Prepared) -> ExitCode {
+fn run_supervised(config: BootConfig) -> ExitCode {
     let runtime_config = into_runtime_config(&config);
     if let Err(error) = runtime_config.validate() {
         tracing::error!(%error, "derived runtime configuration is invalid");
@@ -253,11 +245,11 @@ fn run_supervised(config: BootConfig, prepared: Prepared) -> ExitCode {
         }
     };
 
-    tokio_runtime.block_on(boot_serve(runtime, config, prepared))
+    tokio_runtime.block_on(boot_serve(runtime, config))
 }
 
 /// The async supervisor body (steps 11–18).
-async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig, prepared: Prepared) -> ExitCode {
+async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig) -> ExitCode {
     let (serve_tx, serve_rx) = watch::channel(false);
 
     // Step 11: same background machinery app.rs::serve starts.
@@ -304,11 +296,6 @@ async fn boot_serve(runtime: Arc<Runtime>, config: BootConfig, prepared: Prepare
             tracing::error!(run = %step.run, "lifecycle step failed; aborting boot");
             return shutdown_with(&runtime, &serve_tx, control_handle, code).await;
         }
-    }
-
-    // Step 15b: launch sshd as a managed background child (its grandchildren reap via the reaper).
-    if let Some(ssh) = &prepared.ssh {
-        launch_sshd(&runtime, ssh);
     }
 
     // Step 15: launch the harness through exec so its telemetry is captured. Subscribe to the bus
@@ -364,6 +351,7 @@ async fn run_lifecycle_step(
         cwd: Some(cwd.display().to_string()),
         env: vec![],
         stdin: false,
+        attach: false,
         timeout_millis: None,
         background: false,
         capture: Some(CapturePolicy::default()),
@@ -382,33 +370,6 @@ async fn run_lifecycle_step(
         ExitStatus::Code(0) => Ok(()),
         ExitStatus::Code(code) => Err(exit_code_from(code)),
         ExitStatus::Signal(_) | ExitStatus::Lost => Err(ExitCode::FAILURE),
-    }
-}
-
-/// Launch sshd as a managed background process (E7i).
-fn launch_sshd(runtime: &Arc<Runtime>, ssh: &ssh::SshArtifacts) {
-    let args = ExecArgs {
-        execution_id: runtime.default_execution_id(),
-        session_id: None,
-        executable: ssh.sshd_path.display().to_string(),
-        args: vec![
-            "-D".to_owned(),
-            "-f".to_owned(),
-            ssh.config_path.display().to_string(),
-            "-E".to_owned(),
-            ssh.log_path.display().to_string(),
-        ],
-        cwd: None,
-        env: vec![],
-        stdin: false,
-        timeout_millis: None,
-        background: true,
-        capture: Some(CapturePolicy::default()),
-        graceful_signal: None,
-    };
-    match runtime.spawn_managed(args) {
-        Ok(_) => tracing::info!(port = ssh.port, "sshd listening"),
-        Err(error) => tracing::warn!(%error, "failed to launch sshd; continuing without ssh"),
     }
 }
 
@@ -449,6 +410,7 @@ fn launch_harness(runtime: &Arc<Runtime>, config: &BootConfig) -> Result<Process
         cwd: Some(cwd.display().to_string()),
         env: vec![],
         stdin: false,
+        attach: false,
         timeout_millis: None,
         background: false,
         capture: Some(CapturePolicy::default()),
@@ -520,8 +482,8 @@ fn exit_code_from(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1))
 }
 
-/// Steps 17–18: begin graceful shutdown (terminates the harness + sshd groups), stop the control
-/// task, and finish shutdown, then return `code`.
+/// Steps 17–18: begin graceful shutdown (terminates the harness group), stop the control task, and
+/// finish shutdown, then return `code`.
 async fn shutdown_with(
     runtime: &Arc<Runtime>,
     serve_tx: &watch::Sender<bool>,

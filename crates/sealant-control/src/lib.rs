@@ -14,4 +14,4 @@ pub mod service;
 pub use frame::{FrameError, read_frame, write_frame};
 pub use peer::peer_allowed;
 pub use server::{ConnError, handle_connection, serve_stdio, serve_unix};
-pub use service::ControlService;
+pub use service::{ChannelRegistry, ConnHandle, ControlService};

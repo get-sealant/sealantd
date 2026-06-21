@@ -10,7 +10,9 @@
 pub mod platform;
 pub mod registry;
 pub mod runtime;
+pub mod sftp;
 pub mod signals;
 
 pub use registry::{ProcessEntry, ProcessRegistry};
 pub use runtime::ProcessRuntime;
+pub use sftp::SftpRuntime;

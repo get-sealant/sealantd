@@ -18,11 +18,50 @@ import {
   type ClientMessage,
   type ServerMessage,
   type EventEnvelope,
+  type StreamFrame,
 } from "./gen/sealant_pb.js";
 
 // Re-export the full generated surface (types, enums, schemas) plus protobuf-es `create`.
 export * from "./gen/sealant_pb.js";
 export { create } from "@bufbuild/protobuf";
+
+// Explicit named re-exports of the channel-multiplexing surface (ADR-0012 byte conduits). These all
+// flow through the `export *` above too; they are spelled out here so the multiplexing additions are
+// a documented, stable part of the package API and easy to discover/import.
+export {
+  // Channel stream frames carried on ClientMessage::Stream / ServerMessage::Stream.
+  StreamFrameSchema,
+  StreamWindowUpdateSchema,
+  StreamEndSchema,
+  type StreamFrame,
+  type StreamWindowUpdate,
+  type StreamEnd,
+  // Commands that open/close multiplexed channels.
+  AttachSessionArgsSchema,
+  DetachSessionArgsSchema,
+  OpenForwardArgsSchema,
+  CloseForwardArgsSchema,
+  OpenSftpArgsSchema,
+  CloseSftpArgsSchema,
+  type AttachSessionArgs,
+  type DetachSessionArgs,
+  type OpenForwardArgs,
+  type CloseForwardArgs,
+  type OpenSftpArgs,
+  type CloseSftpArgs,
+  // Results that carry the freshly-allocated channel_id back to the caller.
+  StreamAttachedSchema,
+  ForwardOpenedSchema,
+  SftpOpenedSchema,
+  ProcessAttachedSchema,
+  type StreamAttached,
+  type ForwardOpened,
+  type SftpOpened,
+  type ProcessAttached,
+  // Interactive-vs-observe attach mode enum.
+  AttachMode,
+  AttachModeSchema,
+} from "./gen/sealant_pb.js";
 
 /** Current wire schema version. */
 export const SCHEMA_VERSION = 1;
@@ -37,6 +76,12 @@ export function encodeClient(message: ClientMessage): Uint8Array {
 /** Decode a server message from protobuf bytes. */
 export function decodeServer(bytes: Uint8Array): ServerMessage {
   return fromBinary(ServerMessageSchema, bytes);
+}
+
+/** Encode a server message to protobuf bytes (symmetric with {@link encodeClient}; used by the daemon
+ * side and by tests/mocks that synthesize `ServerMessage`s — e.g. demuxed `StreamFrame`s). */
+export function encodeServer(message: ServerMessage): Uint8Array {
+  return toBinary(ServerMessageSchema, message);
 }
 
 /** Decode a single telemetry event from protobuf bytes (e.g. a spooled record). */
@@ -86,4 +131,10 @@ export function asResponse(message: ServerMessage) {
 /** Narrow a server message to its telemetry event (or `undefined`). */
 export function asEvent(message: ServerMessage): EventEnvelope | undefined {
   return message.message.case === "event" ? message.message.value : undefined;
+}
+
+/** Narrow a server message to a channel `StreamFrame` (or `undefined`). The multiplexing consumer
+ * routes these by `channelId` into per-channel byte sinks. */
+export function asStream(message: ServerMessage): StreamFrame | undefined {
+  return message.message.case === "stream" ? message.message.value : undefined;
 }
