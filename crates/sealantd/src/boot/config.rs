@@ -17,10 +17,6 @@ use crate::boot::error::BootError;
 const DEFAULT_SANDBOX_ROOT: &str = "/sandbox";
 /// Default working directory when `SEALANT_WORKING_DIRECTORY` is unset.
 const DEFAULT_WORKING_DIRECTORY: &str = "/sandbox/repo";
-/// Default SSH listen port.
-const DEFAULT_SSH_PORT: u16 = 2222;
-/// Default authorized-keys file when SSH is enabled but no explicit file is given.
-const DEFAULT_AUTHORIZED_KEYS_FILE: &str = "/run/keys/authorized_keys";
 /// Default control socket path.
 const DEFAULT_CONTROL_SOCKET: &str = "/run/sealant/control.sock";
 /// Default HTTP git/dotfiles username.
@@ -38,10 +34,6 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_SANDBOX_AUTH_KEY_BASE64",
     "SEALANT_SANDBOX_HTTP_USERNAME",
     "SEALANT_SANDBOX_HTTP_TOKEN",
-    "SEALANT_ENABLE_SSH",
-    "SEALANT_SSH_PORT",
-    "SEALANT_SSH_AUTHORIZED_KEYS_FILE",
-    "SEALANT_SSH_AUTHORIZED_KEYS_BASE64",
     "SEALANT_DOTFILES_RUNTIME_APPLY",
     "SEALANT_DOTFILES_REPO_URL",
     "SEALANT_DOTFILES_REPO_REF",
@@ -62,7 +54,6 @@ const CONSUMED_KEYS: &[&str] = &[
     "SEALANT_OS_FAMILY",
     "SEALANT_LOGIN_SHELL_PATH",
     "SEALANT_BASH_SHELL_PATH",
-    "SEALANT_SSHD_PATH",
     "SEALANT_CONTROL_SOCKET",
     "SEALANT_WATCH_FILESYSTEM",
     "SEALANT_NETWORK_PROXY",
@@ -171,22 +162,6 @@ pub enum CloneAuth {
         username: String,
         /// The token/password.
         token: String,
-    },
-}
-
-/// SSH bring-up configuration.
-#[derive(Debug, Clone)]
-pub enum SshConfig {
-    /// SSH disabled (default).
-    Disabled,
-    /// SSH enabled.
-    Enabled {
-        /// Listen port.
-        port: u16,
-        /// Authorized-keys file (used when no base64 blob is provided).
-        authorized_keys_file: PathBuf,
-        /// Optional base64-encoded authorized-keys blob (preferred when present).
-        authorized_keys_b64: Option<String>,
     },
 }
 
@@ -335,8 +310,6 @@ pub struct ShellPaths {
     pub login: PathBuf,
     /// The bash path (e.g. `/bin/bash`).
     pub bash: PathBuf,
-    /// The sshd path (e.g. `/usr/sbin/sshd`).
-    pub sshd: PathBuf,
 }
 
 /// Control-server + telemetry knobs.
@@ -365,8 +338,6 @@ pub struct BootConfig {
     pub repo: RepoConfig,
     /// Clone authentication.
     pub clone_auth: CloneAuth,
-    /// SSH configuration.
-    pub ssh: SshConfig,
     /// Runtime-applied dotfiles, when configured.
     pub dotfiles: Option<DotfilesConfig>,
     /// Lifecycle steps.
@@ -430,7 +401,6 @@ impl BootConfig {
         let repo = RepoConfig { url, reference };
 
         let clone_auth = Self::load_clone_auth(env);
-        let ssh = Self::load_ssh(env);
         let dotfiles = Self::load_dotfiles(env)?;
         let lifecycle = LifecycleConfig {
             setup: parse_lifecycle(env, "SEALANT_LIFECYCLE_SETUP_JSON")?,
@@ -475,11 +445,6 @@ impl BootConfig {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "/bin/bash".to_owned())
                 .into(),
-            sshd: env
-                .get("SEALANT_SSHD_PATH")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| default_sshd_path(os_family).to_owned())
-                .into(),
         };
 
         let control = ControlConfig {
@@ -508,7 +473,6 @@ impl BootConfig {
             workspace,
             repo,
             clone_auth,
-            ssh,
             dotfiles,
             lifecycle,
             foreground,
@@ -539,30 +503,6 @@ impl BootConfig {
             return CloneAuth::HttpToken { username, token };
         }
         CloneAuth::None
-    }
-
-    fn load_ssh(env: &dyn EnvSource) -> SshConfig {
-        let enabled = env.get("SEALANT_ENABLE_SSH").is_some_and(|v| is_truthy(&v));
-        if !enabled {
-            return SshConfig::Disabled;
-        }
-        let port = env
-            .get("SEALANT_SSH_PORT")
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .unwrap_or(DEFAULT_SSH_PORT);
-        let authorized_keys_file = env
-            .get("SEALANT_SSH_AUTHORIZED_KEYS_FILE")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_AUTHORIZED_KEYS_FILE.to_owned())
-            .into();
-        let authorized_keys_b64 = env
-            .get("SEALANT_SSH_AUTHORIZED_KEYS_BASE64")
-            .filter(|s| !s.is_empty());
-        SshConfig::Enabled {
-            port,
-            authorized_keys_file,
-            authorized_keys_b64,
-        }
     }
 
     fn load_dotfiles(env: &dyn EnvSource) -> Result<Option<DotfilesConfig>, BootError> {
@@ -703,13 +643,6 @@ fn default_login_shell(family: OsFamily) -> &'static str {
     }
 }
 
-fn default_sshd_path(family: OsFamily) -> &'static str {
-    match family {
-        OsFamily::Fedora | OsFamily::Arch => "/usr/sbin/sshd",
-        OsFamily::Nix => "/usr/bin/sshd",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,12 +674,10 @@ mod tests {
         assert_eq!(cfg.repo.url, "git@github.com:o/r.git");
         assert_eq!(cfg.repo.reference, "main");
         assert!(matches!(cfg.clone_auth, CloneAuth::None));
-        assert!(matches!(cfg.ssh, SshConfig::Disabled));
         assert!(cfg.dotfiles.is_none());
         assert_eq!(cfg.os_family, OsFamily::Fedora);
         assert_eq!(cfg.oci_runtime, OciRuntime::Runc);
         assert_eq!(cfg.shells.login, PathBuf::from("/usr/bin/zsh"));
-        assert_eq!(cfg.shells.sshd, PathBuf::from("/usr/sbin/sshd"));
         assert_eq!(
             cfg.control.socket,
             PathBuf::from("/run/sealant/control.sock")
@@ -800,43 +731,6 @@ mod tests {
             }
             other => panic!("expected http token, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn ssh_enabled_parses_port_and_keys() {
-        let cfg = load_with(&[
-            ("SEALANT_ENABLE_SSH", "true"),
-            ("SEALANT_SSH_PORT", "2200"),
-            ("SEALANT_SSH_AUTHORIZED_KEYS_BASE64", "a2V5"),
-        ])
-        .expect("valid");
-        match cfg.ssh {
-            SshConfig::Enabled {
-                port,
-                authorized_keys_b64,
-                authorized_keys_file,
-            } => {
-                assert_eq!(port, 2200);
-                assert_eq!(authorized_keys_b64.as_deref(), Some("a2V5"));
-                assert_eq!(
-                    authorized_keys_file,
-                    PathBuf::from("/run/keys/authorized_keys")
-                );
-            }
-            other => panic!("expected ssh enabled, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ssh_disabled_when_flag_absent_or_false() {
-        assert!(matches!(
-            load_with(&[("SEALANT_ENABLE_SSH", "false")]).unwrap().ssh,
-            SshConfig::Disabled
-        ));
-        assert!(matches!(
-            load_with(&[("SEALANT_ENABLE_SSH", "0")]).unwrap().ssh,
-            SshConfig::Disabled
-        ));
     }
 
     #[test]
