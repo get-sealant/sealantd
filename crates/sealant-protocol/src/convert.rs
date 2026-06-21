@@ -14,8 +14,8 @@ use crate::{
     ControlErrorCode, ControlRequest, ControlResponse, Encoding, EnvVar, EventEnvelope,
     EventPayload, ExecAccepted, ExecArgs, ExecutionStartArgs, ExitReason, Feature, FeatureMatrix,
     FeatureState, ForwardOpened, HealthReport, IoChunk, Limits, NetworkMode, OpenForwardArgs,
-    OpenSessionArgs, OpenSftpArgs, ProcessExited, ProcessList, ProcessStarted, ProcessState,
-    ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
+    OpenSessionArgs, OpenSftpArgs, ProcessAttached, ProcessExited, ProcessList, ProcessStarted,
+    ProcessState, ProcessSummary, ResponseOutcome, RuntimeHeartbeat, RuntimeMetrics, RuntimeState,
     RuntimeStateChanged, ServerMessage, SessionList, SessionOpened, SessionSummary, SftpOpened,
     ShutdownAccepted, Signal, StreamAttached, StreamEnd, StreamFrame, StreamKind, StreamPayload,
     TelemetryDropped, TransformMeta,
@@ -739,6 +739,7 @@ impl From<ExecArgs> for wire::ExecArgs {
             background: a.background,
             capture: a.capture.map(Into::into),
             graceful_signal: a.graceful_signal.map(enum_i32::<_, wire::Signal>),
+            attach: a.attach,
         }
     }
 }
@@ -757,6 +758,7 @@ impl TryFrom<wire::ExecArgs> for ExecArgs {
             background: a.background,
             capture: a.capture.map(TryInto::try_into).transpose()?,
             graceful_signal: a.graceful_signal.map(signal).transpose()?,
+            attach: a.attach,
         })
     }
 }
@@ -1188,6 +1190,12 @@ impl From<CommandResult> for wire::command_result::Result {
             CommandResult::StreamAttached(s) => W::StreamAttached(wire::StreamAttached {
                 channel_id: s.channel_id.into_inner(),
             }),
+            CommandResult::ProcessAttached(p) => W::ProcessAttached(wire::ProcessAttached {
+                process_id: p.process_id.into_inner(),
+                pid: p.pid,
+                pgid: p.pgid,
+                channel_id: p.channel_id.into_inner(),
+            }),
             CommandResult::ForwardOpened(f) => W::ForwardOpened(wire::ForwardOpened {
                 channel_id: f.channel_id.into_inner(),
             }),
@@ -1241,6 +1249,12 @@ impl TryFrom<wire::command_result::Result> for CommandResult {
             }),
             W::StreamAttached(s) => CommandResult::StreamAttached(StreamAttached {
                 channel_id: ChannelId::new(s.channel_id),
+            }),
+            W::ProcessAttached(p) => CommandResult::ProcessAttached(ProcessAttached {
+                process_id: ProcessId::new(p.process_id),
+                pid: p.pid,
+                pgid: p.pgid,
+                channel_id: ChannelId::new(p.channel_id),
             }),
             W::ForwardOpened(f) => CommandResult::ForwardOpened(ForwardOpened {
                 channel_id: ChannelId::new(f.channel_id),
@@ -1528,6 +1542,7 @@ mod tests {
                     value: "b".into(),
                 }],
                 stdin: true,
+                attach: true,
                 timeout_millis: Some(5000),
                 background: false,
                 capture: None,

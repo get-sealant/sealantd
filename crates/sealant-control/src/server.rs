@@ -13,7 +13,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::frame::{FrameError, read_frame, write_frame};
-use crate::service::{ChannelRegistry, ConnHandle, ControlService};
+use crate::service::{ChannelRegistry, CloserRegistry, ConnHandle, ControlService};
 
 /// Per-connection outbound queue capacity (responses + forwarded events).
 const OUTBOUND_CAPACITY: usize = 256;
@@ -107,12 +107,19 @@ pub async fn handle_connection<S, R, W>(
 
     // Per-connection channel registry: ChannelId -> inbound sink (gateway → far end). Owned here and
     // shared into the ConnHandle so streaming commands register their sink and so dropping it on
-    // teardown closes every pump task. Channels are connection-scoped: when this connection drops,
-    // all its PTY attaches / forwards / sftp bridges die.
+    // teardown closes every inbound pump task. Channels are connection-scoped: when this connection
+    // drops, all its PTY attaches / forwards / sftp bridges die.
     let channels: ChannelRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    // Per-connection closer registry: ChannelId -> eager teardown action. Dropping the inbound sink
+    // (above) only ends the inbound pump; an idle/never-writing upstream's *outbound* pump blocks on
+    // read() and never observes the closed out_tx, so it must be aborted explicitly. Each streaming
+    // command registers a closer that aborts both pumps AND reaps the runtime map entry; we drain and
+    // invoke all of them on teardown so nothing leaks per disconnect.
+    let closers: CloserRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let conn = ConnHandle {
         out_tx: out_tx.clone(),
         channels: channels.clone(),
+        closers: closers.clone(),
         shutdown: shutdown.clone(),
     };
 
@@ -198,10 +205,17 @@ pub async fn handle_connection<S, R, W>(
         }
     }
 
-    // Tear down: clearing the channel registry drops every inbound sink so the per-channel pump
-    // tasks observe closed senders and exit (connection-scoped channel lifetime); dropping out_tx +
-    // aborting the forwarder closes the outbound queue so the writer drains and exits. We also drop
-    // the ConnHandle (which holds clones of both) before joining the writer.
+    // Tear down EVERY channel registered on this connection, eagerly. This is the load-bearing
+    // half: draining the closer registry aborts both pumps of each forward/sftp/attach AND reaps its
+    // runtime map entry — so an idle forward whose outbound pump is blocked on read() (and would
+    // otherwise never observe the closed out_tx) is killed and unregistered, not leaked. We run the
+    // closers before clearing the inbound-sink registry; clearing the latter then ends any inbound
+    // pump that the closer did not already abort. Dropping out_tx + aborting the forwarder closes the
+    // outbound queue so the writer drains and exits.
+    let drained: Vec<_> = closers.lock().await.drain().map(|(_, c)| c).collect();
+    for closer in drained {
+        closer();
+    }
     channels.lock().await.clear();
     drop(conn);
     drop(out_tx);

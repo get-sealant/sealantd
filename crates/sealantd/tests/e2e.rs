@@ -31,6 +31,7 @@ fn exec_args(executable: &str, args: &[&str]) -> ExecArgs {
         cwd: None,
         env: vec![],
         stdin: false,
+        attach: false,
         timeout_millis: None,
         background: false,
         capture: None,
@@ -753,4 +754,268 @@ async fn in_process_connection_drop_tears_down_attachment() {
         cleared,
         "attachment should clear after the gateway connection drops"
     );
+}
+
+/// §0.3 BLOCKER — eager teardown of an IDLE forward. The old teardown only dropped inbound sinks;
+/// an idle upstream that never writes leaves the socket→gateway pump blocked on read() forever
+/// (it never calls out_tx.send, so never observes the closed queue), leaking the task, the socket
+/// FD, and the un-reaped ForwardRuntime map entry per disconnect. This test opens a forward to an
+/// upstream that accepts but NEVER writes, drops the control connection, and asserts:
+///   1. handle_connection returns promptly (no hang, bounded),
+///   2. the ForwardRuntime map entry is removed (the eager closer ran), and
+///   3. the upstream socket is closed (the read pump was aborted, dropping the TcpStream → the
+///      upstream's read() returns 0/EOF), proving the FD was reaped.
+#[tokio::test]
+async fn in_process_idle_forward_torn_down_on_connection_drop() {
+    use tokio::io::AsyncReadExt;
+
+    // Upstream that accepts one connection and NEVER writes — it only waits to observe its peer
+    // close. This is the VSCode-Server idle steady state (an open forward with no traffic).
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind idle upstream");
+    let addr = listener.local_addr().expect("addr");
+    let (peer_closed_tx, peer_closed_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        // Block reading; the daemon never sends anything either. When the daemon aborts its pumps,
+        // its TcpStream drops and our read returns 0 (EOF) — the proof the FD was closed.
+        let mut b = [0u8; 64];
+        let n = s.read(&mut b).await.unwrap_or(0);
+        assert_eq!(n, 0, "idle upstream should only ever see EOF, never bytes");
+        let _ = peer_closed_tx.send(());
+    });
+
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+    let (mut client, conn) = wire_runtime(runtime.clone());
+
+    // Enable forwarding (gated behind networkCollection).
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("g0"),
+            Command::SetFeatureState {
+                feature: Feature::NetworkCollection,
+                enabled: true,
+            },
+        ),
+    )
+    .await;
+    loop {
+        if let ServerMessage::Response(r) = recv_message(&mut client).await
+            && r.request_id == RequestId::new("g0")
+        {
+            assert!(r.is_ok());
+            break;
+        }
+    }
+
+    // Open the forward to the idle upstream.
+    send_request(
+        &mut client,
+        ControlRequest::new(
+            RequestId::new("g1"),
+            Command::OpenForward(OpenForwardArgs {
+                host: "127.0.0.1".to_owned(),
+                port: addr.port(),
+                execution_id: None,
+            }),
+        ),
+    )
+    .await;
+    let _channel: ChannelId = {
+        let find = async {
+            loop {
+                if let ServerMessage::Response(r) = recv_message(&mut client).await
+                    && r.request_id == RequestId::new("g1")
+                    && let ResponseOutcome::Ok {
+                        result: Some(CommandResult::ForwardOpened(f)),
+                    } = r.outcome
+                {
+                    return f.channel_id;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), find)
+            .await
+            .expect("forward opened")
+    };
+    assert_eq!(runtime.forward_count(), 1, "forward should be registered");
+
+    // Drop the control connection. The eager closer must abort BOTH pumps (including the idle,
+    // read-blocked socket→gateway pump) and reap the ForwardRuntime map entry.
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("handle_connection must return promptly (no hang)")
+        .expect("join");
+
+    // (2) Map entry removed — no per-disconnect leak.
+    let mut reaped = false;
+    for _ in 0..100 {
+        if runtime.forward_count() == 0 {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reaped,
+        "ForwardRuntime map entry must be removed on connection teardown"
+    );
+
+    // (3) Socket/FD closed — the upstream observed EOF, which only happens once the daemon's
+    // TcpStream (both pump halves) is dropped by the abort.
+    tokio::time::timeout(Duration::from_secs(5), peer_closed_rx)
+        .await
+        .expect("upstream must see EOF (socket FD closed by the aborted pump)")
+        .expect("peer-closed signal");
+}
+
+/// §1.A exec-attach: run a command that emits a LARGE burst, attach via `exec{attach:true}`, and
+/// assert lossless ordered delivery over the StreamFrame channel + End{exit_code}. Confirms it runs
+/// alongside the unchanged IoChunk telemetry (both carry the full output).
+#[tokio::test]
+async fn in_process_exec_attach_streams_burst_losslessly_with_exit_code() {
+    let mut config = RuntimeConfig::new(new_runtime_id());
+    config.workspace_root = std::env::temp_dir();
+    let runtime = Runtime::new(config, Arc::new(ShutdownSignal::new(1000)));
+    runtime.mark_healthy();
+
+    // Subscribe to telemetry BEFORE spawning so we can prove the IoChunk tap still sees the output.
+    // Drain it in a CONCURRENT task: the attach channel is consumed slowly (to exercise
+    // backpressure), so a non-draining telemetry subscriber would lag (broadcast overflow) and lose
+    // chunks. Draining in parallel proves the always-on IoChunk tap carries the full output
+    // independently of the attach stream's pacing.
+    let mut telemetry = runtime.event_subscriber();
+    let telemetry_task = tokio::spawn(async move {
+        let mut tele = String::new();
+        loop {
+            match telemetry.recv().await {
+                Ok(env) => match env.payload {
+                    EventPayload::IoChunk(c) if c.stream == StreamKind::Stdout => {
+                        if let Some(content) = c.content {
+                            tele.push_str(&String::from_utf8_lossy(content.as_slice()));
+                        }
+                    }
+                    EventPayload::ProcessExited(_) => break,
+                    _ => {}
+                },
+                // A real lag would mean the tap lost data; surface it rather than silently passing.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    panic!("telemetry subscriber lagged ({n} dropped) — tap lost data");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        tele
+    });
+
+    let (mut client, conn) = wire_runtime(runtime.clone());
+
+    // A large, verifiable burst: 20000 numbered lines on stdout. The attach channel must deliver
+    // every line in order despite our slow draining (backpressure), with a non-zero exit code.
+    let script = "i=0; while [ $i -lt 20000 ]; do echo $i; i=$((i+1)); done; exit 3";
+    let mut args = exec_args("/bin/sh", &["-c", script]);
+    args.attach = true;
+
+    send_request(
+        &mut client,
+        ControlRequest::new(RequestId::new("e1"), Command::Exec(args)),
+    )
+    .await;
+
+    // The exec-attach result carries both the process id and the channel.
+    let channel = {
+        let find = async {
+            loop {
+                if let ServerMessage::Response(r) = recv_message(&mut client).await
+                    && r.request_id == RequestId::new("e1")
+                {
+                    match r.outcome {
+                        ResponseOutcome::Ok {
+                            result: Some(CommandResult::ProcessAttached(p)),
+                        } => return p.channel_id,
+                        other => panic!("expected ProcessAttached, got {other:?}"),
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), find)
+            .await
+            .expect("process attached")
+    };
+
+    // Drain the attach channel slowly; assert per-channel seq monotonicity (drop detection) and
+    // reassemble every line, then read End{exit_code}.
+    let mut out = Vec::new();
+    let mut last_seq: Option<u64> = None;
+    let mut exit_code = None;
+    let mut count = 0u64;
+    let collect = async {
+        loop {
+            if let ServerMessage::Stream(frame) = recv_message(&mut client).await
+                && frame.channel_id == channel
+            {
+                match frame.payload {
+                    StreamPayload::Data { data } => {
+                        if let Some(prev) = last_seq {
+                            assert_eq!(frame.seq, prev + 1, "seq gap: exec-attach dropped a frame");
+                        }
+                        last_seq = Some(frame.seq);
+                        out.extend_from_slice(data.as_slice());
+                        count += 1;
+                        if count.is_multiple_of(11) {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    }
+                    StreamPayload::End(end) => {
+                        exit_code = Some(end.exit_code);
+                        break;
+                    }
+                    StreamPayload::WindowUpdate { .. } => {}
+                }
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), collect)
+        .await
+        .expect("exec-attach delivers all output then End without hanging");
+
+    // Lossless + ordered: every line 0..20000 present in order.
+    let text = String::from_utf8_lossy(&out);
+    let numbers: Vec<u64> = text
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    assert_eq!(numbers.len(), 20000, "expected 20000 lines on the channel");
+    for (idx, &n) in numbers.iter().enumerate() {
+        assert_eq!(
+            n, idx as u64,
+            "out-of-order/missing exec-attach line at {idx}"
+        );
+    }
+    assert_eq!(
+        exit_code,
+        Some(Some(3)),
+        "End must carry the process exit code"
+    );
+
+    // The IoChunk telemetry tap must ALSO have carried the same output in parallel (proving the
+    // attach is a distinct, additional path — not a replacement for the always-on telemetry).
+    let tele = tokio::time::timeout(Duration::from_secs(10), telemetry_task)
+        .await
+        .expect("telemetry task should finish")
+        .expect("telemetry task join");
+    let tele_numbers = tele.split_whitespace().filter(|s| !s.is_empty()).count();
+    assert_eq!(
+        tele_numbers, 20000,
+        "IoChunk telemetry must still carry the full output in parallel"
+    );
+
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
 }

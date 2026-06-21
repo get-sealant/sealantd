@@ -144,6 +144,16 @@ pub struct ExecArgs {
     /// Open a stdin pipe so the client can `writeStdin`.
     #[serde(default)]
     pub stdin: bool,
+    /// Bind this process's stdout/stderr to a fresh reliable [`ChannelId`] (exec-attach, §1.A).
+    ///
+    /// When set, the process's combined stdout+stderr is delivered over a backpressured
+    /// `StreamFrame::Data` channel exactly like a session attach — raw bytes, never redacted or
+    /// coalesced, terminated by `StreamFrame::End{exit_code}` on process exit. The result carries the
+    /// minted channel (`ProcessAttached`) instead of the bare `ExecAccepted`. The lossy `IoChunk`
+    /// telemetry tap stays on in parallel; the channel is the faithful path VSCode's non-PTY
+    /// bootstrap reads from. Requires a connection-scoped writer (the request is routed accordingly).
+    #[serde(default)]
+    pub attach: bool,
     /// Timeout after which the process is terminated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_millis: Option<u64>,
@@ -656,6 +666,22 @@ pub struct StreamAttached {
     pub channel_id: ChannelId,
 }
 
+/// Result of an exec-attach (`exec` with `attach: true`): the process was accepted *and* its
+/// stdout/stderr now stream over a fresh reliable channel (§1.A exec-attach). Symmetric to
+/// [`ExecAccepted`] + [`StreamAttached`].
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessAttached {
+    /// Stable logical process id (as in [`ExecAccepted`]).
+    pub process_id: ProcessId,
+    /// OS pid.
+    pub pid: i32,
+    /// OS process group id.
+    pub pgid: i32,
+    /// The newly minted output channel carrying the process's stdout/stderr.
+    pub channel_id: ChannelId,
+}
+
 /// Result of `openForward`: the channel the forwarded TCP bytes now flow on.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -694,6 +720,8 @@ pub enum CommandResult {
     ShutdownAccepted(ShutdownAccepted),
     /// Session output attached to a channel.
     StreamAttached(StreamAttached),
+    /// `exec` accepted with its stdout/stderr attached to a channel (exec-attach).
+    ProcessAttached(ProcessAttached),
     /// A forward was opened on a channel.
     ForwardOpened(ForwardOpened),
     /// An SFTP bridge was opened on a channel.
@@ -716,6 +744,7 @@ mod tests {
             cwd: None,
             env: vec![],
             stdin: false,
+            attach: false,
             timeout_millis: None,
             background: false,
             capture: None,

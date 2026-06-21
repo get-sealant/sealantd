@@ -168,6 +168,7 @@ mod tests {
                 cwd: None,
                 env: vec![],
                 stdin: false,
+                attach: false,
                 timeout_millis: None,
                 background: false,
                 capture: None,

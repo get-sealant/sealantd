@@ -265,6 +265,43 @@ mod tests {
         assert!(rt.is_empty());
     }
 
+    /// An IDLE upstream (accepts, never writes) leaves the socket→gateway pump blocked on read().
+    /// `close` must abort it and remove the map entry regardless — this is the teardown path that
+    /// connection drop relies on. We also assert the upstream sees EOF, proving the FD was closed.
+    #[tokio::test]
+    async fn close_reaps_idle_forward_and_closes_socket() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            // Never write; just wait for the peer (the daemon) to close, then signal EOF.
+            let mut b = [0u8; 16];
+            let n = s.read(&mut b).await.unwrap_or(0);
+            assert_eq!(n, 0, "idle upstream must only see EOF");
+            let _ = eof_tx.send(());
+        });
+
+        let (out_tx, _out_rx) = mpsc::channel::<ServerMessage>(8);
+        let rt = ForwardRuntime::new();
+        let channel = ChannelId::new("chan_idle");
+        let _inbound = rt
+            .open(channel.clone(), "127.0.0.1", addr.port(), None, out_tx)
+            .await
+            .expect("open forward");
+        assert_eq!(rt.len(), 1);
+
+        // The socket→gateway pump is now blocked on read() (upstream never writes). close() must
+        // still abort it and drop the entry — without depending on out_tx ever being observed.
+        rt.close(&channel);
+        assert!(rt.is_empty(), "close must remove the map entry");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), eof_rx)
+            .await
+            .expect("upstream must see EOF once the aborted pump drops the socket")
+            .expect("eof signal");
+    }
+
     #[tokio::test]
     async fn forward_connect_failure_is_an_error() {
         let (out_tx, _out_rx) = mpsc::channel::<ServerMessage>(8);
